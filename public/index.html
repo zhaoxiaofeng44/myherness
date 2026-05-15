@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Code Console</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="logo">CC</div>
+          <div>
+            <div class="brand-title">Claude Code Console</div>
+            <div class="brand-sub" id="cwdLabel">…</div>
+          </div>
+        </div>
+
+        <button id="newSessionBtn" class="primary-btn">＋ 新建会话</button>
+
+        <nav class="nav">
+          <div class="nav-section-title">会话</div>
+          <ul id="sessionList" class="session-list"></ul>
+          <div class="nav-section-title" style="margin-top:18px">视图</div>
+          <ul class="nav-list">
+            <li><button data-view="chat" class="nav-btn active">对话</button></li>
+            <li><button data-view="changes" class="nav-btn">变更</button></li>
+            <li><button data-view="structure" class="nav-btn">结构图</button></li>
+            <li><button data-view="audit" class="nav-btn">审计回放</button></li>
+            <li><button data-view="policy" class="nav-btn">策略</button></li>
+          </ul>
+        </nav>
+
+        <div class="footer-status" id="connStatus">连接中…</div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div class="session-info">
+            <div class="session-title" id="sessionTitle">未选择会话</div>
+            <div class="session-meta" id="sessionMeta"></div>
+          </div>
+        </header>
+
+        <section class="view" id="view-chat">
+          <div class="chat-pane" id="chatPane"></div>
+          <div class="approval-pane" id="approvalPane"></div>
+          <form id="promptForm" class="prompt-form">
+            <div class="prompt-toolbar">
+              <span id="statusPill" class="status-pill"></span>
+              <select id="policySelect" title="切换会话策略（运行模式）"></select>
+              <button id="cancelBtn" type="button" class="ghost-btn" disabled>停止</button>
+            </div>
+            <div class="prompt-input-row">
+              <textarea id="promptInput" placeholder="向 Claude Code 发送指令…（Cmd/Ctrl + Enter 发送）" rows="3"></textarea>
+              <button type="submit" class="primary-btn">发送</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="view hidden" id="view-changes">
+          <div class="changes-list" id="changesList"></div>
+          <div class="changes-detail" id="changesDetail"></div>
+        </section>
+
+        <section class="view hidden" id="view-structure">
+          <div class="structure-toolbar">
+            <div class="tab-group" id="structureTabs">
+              <button data-tab="tree" class="tab-btn active">目录树</button>
+              <button data-tab="modules" class="tab-btn">模块依赖图</button>
+              <button data-tab="codemap" class="tab-btn">代码地图</button>
+              <button data-tab="gitnexus" class="tab-btn">GitNexus</button>
+            </div>
+            <input id="structureSearch" placeholder="搜索…" />
+            <button id="refreshStructureBtn" class="ghost-btn">刷新</button>
+          </div>
+          <div class="structure-grid" id="structureBody-tree">
+            <div id="structureTree" class="structure-tree"></div>
+            <div id="structureDetail" class="structure-detail">在左侧选择一个节点查看详情。</div>
+          </div>
+          <div class="structure-grid hidden" id="structureBody-modules">
+            <div class="graph-pane">
+              <div class="graph-info muted" id="graphInfo">基于 madge 分析模块依赖（仅当工作目录包含 JS/TS 源文件时生效）。</div>
+              <svg id="moduleGraph" class="module-graph"></svg>
+            </div>
+            <div id="moduleDetail" class="structure-detail">点击节点查看详情。</div>
+          </div>
+          <div class="codemap-body hidden" id="structureBody-codemap">
+            <div class="codemap-overview" id="codemapOverview"></div>
+            <div class="codemap-grid">
+              <div class="codemap-tree" id="codemapTree"></div>
+              <div class="codemap-detail" id="codemapDetail">在左侧选择一个符号查看详情。</div>
+            </div>
+          </div>
+          <div class="gitnexus-body hidden" id="structureBody-gitnexus">
+            <div class="gitnexus-status" id="gitNexusStatus">正在检测 GitNexus…</div>
+            <div class="tab-group gitnexus-subtabs" id="gitNexusSubtabs">
+              <button data-gn="callgraph" class="tab-btn active">调用图</button>
+              <button data-gn="processes" class="tab-btn">执行流</button>
+              <button data-gn="impact" class="tab-btn">影响分析</button>
+            </div>
+            <div class="gitnexus-pane" id="gitNexusPane"></div>
+          </div>
+        </section>
+
+        <section class="view hidden" id="view-audit">
+          <div class="audit-controls">
+            <input id="auditFilter" placeholder="按事件类型/文件名/工具过滤…" />
+            <span id="auditSummary" class="muted"></span>
+          </div>
+          <div id="auditTimeline" class="audit-timeline"></div>
+        </section>
+
+        <section class="view hidden" id="view-policy">
+          <div id="policyView" class="policy-view"></div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="newSessionDialog" class="dialog">
+      <form method="dialog" id="newSessionForm">
+        <h3>新建 Claude Code 会话</h3>
+        <label>
+          会话名称
+          <input id="dlgName" placeholder="留空则使用工作目录名" />
+        </label>
+        <label>
+          工作目录
+          <input id="dlgWorkdir" required placeholder="/absolute/path" />
+        </label>
+        <label>
+          策略
+          <select id="dlgPolicy"></select>
+        </label>
+        <div class="dialog-actions">
+          <button type="button" id="dlgCancel" class="ghost-btn">取消</button>
+          <button type="submit" class="primary-btn">创建</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
