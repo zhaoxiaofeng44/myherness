@@ -13,10 +13,13 @@ import { evaluateToolUse, getPolicy } from './policyEngine.js';
 let _id = 0;
 const nextId = () => `s${Date.now().toString(36)}${(_id++).toString(36)}`;
 
+const MAX_EVENTS = 5000;
+
 export class SessionManager extends EventEmitter {
-  constructor() {
+  constructor({ store } = {}) {
     super();
     this.sessions = new Map();
+    this.store = store || null;
   }
 
   list() {
@@ -44,8 +47,10 @@ export class SessionManager extends EventEmitter {
       policyId: policyId || 'balanced',
       bus: this,
     });
+    session._store = this.store;
     this.sessions.set(session.id, session);
     this.emit('session:created', session.summary());
+    this.store?.scheduleSave(session);
     return session;
   }
 
@@ -54,8 +59,72 @@ export class SessionManager extends EventEmitter {
     if (!s) return false;
     s.stop();
     this.sessions.delete(id);
+    this.store?.remove(id);
     this.emit('session:removed', { id });
     return true;
+  }
+
+  // Rebuild a Session from a persisted payload after a server restart.
+  // Live-only fields (activeChild/activeTurn/pendingApprovals) are reset,
+  // and a synthetic `session:interrupted` event is appended so the audit
+  // log reflects the gap.
+  hydrate(persisted) {
+    const session = new Session({
+      id: persisted.id,
+      workdir: persisted.workdir,
+      name: persisted.name,
+      policyId: persisted.policyId,
+      bus: this,
+    });
+    session._store = this.store;
+
+    // Restore audit/state fields verbatim.
+    session.createdAt = persisted.createdAt;
+    session.endedAt = persisted.endedAt;
+    session.claudeSessionId = persisted.claudeSessionId || null;
+    session.turns = Array.isArray(persisted.turns) ? persisted.turns : [];
+    session.events = Array.isArray(persisted.events) ? persisted.events : [];
+    session.tools = Array.isArray(persisted.tools) ? persisted.tools : [];
+    session.changes = Array.isArray(persisted.changes) ? persisted.changes : [];
+    session.lastChangeMap = persisted.lastChangeMap || {};
+    session.fileBaselines = persisted.fileBaselines || {};
+
+    // Live fields are always fresh.
+    session.activeChild = null;
+    session.activeTurn = null;
+    session.pendingApprovals = new Map();
+
+    const workdirOk =
+      fs.existsSync(persisted.workdir) && fs.statSync(persisted.workdir).isDirectory();
+    if (workdirOk) {
+      // Re-snapshot so the next turn diffs against the post-restart state.
+      session.changeTracker.takeSnapshot();
+      let status = persisted.status;
+      if (status === 'running' || status === 'waiting') status = 'idle';
+      session.status = status || 'idle';
+    } else {
+      session.status = 'error';
+    }
+
+    // Mark any approvals that were pending at shutdown as abandoned.
+    if (Array.isArray(persisted.pendingApprovals)) {
+      for (const a of persisted.pendingApprovals) {
+        session._record({
+          type: 'approval:abandoned',
+          toolUseId: a.toolUseId || a.id,
+          tool: a.tool,
+        });
+      }
+    }
+
+    if (!workdirOk) {
+      session._record({ type: 'session:workdir-missing', workdir: persisted.workdir });
+    }
+    session._record({ type: 'session:interrupted' });
+
+    this.sessions.set(session.id, session);
+    this.emit('session:created', session.summary());
+    return session;
   }
 }
 
@@ -394,7 +463,11 @@ class Session {
   _record(event) {
     const enriched = { id: randomUUID(), ts: Date.now(), ...event };
     this.events.push(enriched);
+    if (this.events.length > MAX_EVENTS) {
+      this.events.splice(0, this.events.length - MAX_EVENTS);
+    }
     this.bus.emit('session:event', { sessionId: this.id, event: enriched });
+    this._store?.scheduleSave(this);
   }
 
   _broadcastSummary() {

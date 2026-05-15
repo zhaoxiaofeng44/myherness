@@ -7,16 +7,28 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { SessionManager } from './src/sessionManager.js';
+import { SessionStore } from './src/sessionStore.js';
 import { PRESET_POLICIES, getPolicy } from './src/policyEngine.js';
 import { scanStructure, annotateChanges } from './src/structure.js';
 import { buildDesignGraph } from './src/designGraph.js';
 import { buildCodeMap } from './src/codeMap.js';
+import * as gitnexus from './src/gitnexus.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const PORT = parseInt(process.env.PORT || '4477', 10);
 
-const manager = new SessionManager();
+const DATA_DIR =
+  process.env.CLAUDE_CONSOLE_DATA || path.join(__dirname, '.claude-console', 'sessions');
+const store = new SessionStore({ dir: DATA_DIR });
+const manager = new SessionManager({ store });
+for (const persisted of store.loadAll()) {
+  try {
+    manager.hydrate(persisted);
+  } catch (e) {
+    console.error(`[startup] failed to hydrate ${persisted?.id}:`, e.message);
+  }
+}
 const sseClients = new Set();
 
 manager.on('session:event', (payload) => broadcast('event', payload));
@@ -62,6 +74,10 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (pathname === '/api/health') return json(res, 200, { ok: true });
+    if (pathname === '/api/gitnexus/health' && req.method === 'GET') {
+      const info = await gitnexus.isAvailable();
+      return json(res, 200, info);
+    }
     if (pathname === '/api/policies') return json(res, 200, { policies: PRESET_POLICIES });
     if (pathname === '/api/sessions' && req.method === 'GET')
       return json(res, 200, { sessions: manager.list() });
@@ -195,6 +211,52 @@ const server = http.createServer(async (req, res) => {
         return json(res, ok ? 200 : 404, { ok });
       }
 
+      if (rest === '/gitnexus/status' && req.method === 'GET') {
+        try {
+          const info = await gitnexus.getStatus(session.workdir);
+          return json(res, 200, info);
+        } catch (e) {
+          return json(res, 500, { error: e.message });
+        }
+      }
+
+      if (rest === '/gitnexus/analyze' && req.method === 'POST') {
+        const body = await readJson(req).catch(() => ({}));
+        // Fire-and-forget: stream lines via SSE, finish event when done.
+        broadcast('gitnexus:start', { sessionId: id });
+        gitnexus
+          .analyze(session.workdir, {
+            force: !!body.force,
+            embeddings: !!body.embeddings,
+            skipAgentsMd: body.skipAgentsMd !== false,
+            onLine: ({ stream, line }) =>
+              broadcast('gitnexus:progress', { sessionId: id, stream, line }),
+          })
+          .then((r) => broadcast('gitnexus:done', { sessionId: id, code: r.code }))
+          .catch((e) => broadcast('gitnexus:done', { sessionId: id, error: e.message }));
+        return json(res, 202, { ok: true });
+      }
+
+      if (rest === '/gitnexus/tool' && req.method === 'POST') {
+        const body = await readJson(req);
+        const kind = body.kind || 'tool';
+        try {
+          let payload;
+          if (kind === 'callgraph') payload = await gitnexus.getCallGraph(session.workdir, body.args || {});
+          else if (kind === 'processes') payload = await gitnexus.getProcesses(session.workdir, body.args || {});
+          else if (kind === 'cypher')
+            payload = await gitnexus.cypher(session.workdir, body.query, body.params || {});
+          else if (kind === 'impact')
+            payload = await gitnexus.getImpact(session.workdir, body.symbol);
+          else if (kind === 'tool')
+            payload = await gitnexus.callTool(session.workdir, body.name, body.args || {});
+          else return json(res, 400, { error: '未知 kind: ' + kind });
+          return json(res, 200, { result: payload });
+        } catch (e) {
+          return json(res, 500, { error: e.message });
+        }
+      }
+
       return json(res, 404, { error: '未知接口' });
     }
 
@@ -240,4 +302,21 @@ server.listen(PORT, () => {
   // eslint-disable-next-line no-console
   console.log(`Claude Code Console running at http://localhost:${PORT}`);
   console.log(`Working directory: ${process.cwd()}`);
+  console.log(`Session data dir: ${DATA_DIR}`);
 });
+
+let shuttingDown = false;
+function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  for (const s of manager.sessions.values()) {
+    try { s.cancel(); } catch {}
+  }
+  // Defer one tick so any in-flight stdout `data` callbacks finish first.
+  setImmediate(() => {
+    try { store.flushAll(manager); } finally { process.exit(0); }
+  });
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+process.on('beforeExit', () => store.flushAll(manager));

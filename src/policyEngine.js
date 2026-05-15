@@ -46,6 +46,21 @@ export const PRESET_POLICIES = {
       { match: 'tool:*', decision: 'auto', reason: '已开启 bypassPermissions，全部跳过' },
     ],
   },
+  auto: {
+    id: 'auto',
+    name: '自动模式',
+    description:
+      '常规工具自动放行；当 Claude 调用 AskUserQuestion / ExitPlanMode 等需要你回答的工具时，弹出交互框等你输入，不会自动跳过',
+    permissionMode: 'acceptEdits',
+    rules: [
+      { match: 'tool:AskUserQuestion', decision: 'manual', reason: '需要你回答 Claude 的提问' },
+      { match: 'tool:ExitPlanMode', decision: 'manual', reason: '需要你确认计划' },
+      { match: 'path:outside-workdir', decision: 'manual', reason: '操作目标在工作目录之外' },
+      { match: 'tool:Bash:rm -rf', decision: 'manual', reason: '涉及递归删除' },
+      { match: 'tool:Bash:git push --force', decision: 'manual', reason: '涉及强制推送' },
+      { match: 'tool:*', decision: 'auto', reason: '自动放行' },
+    ],
+  },
   planOnly: {
     id: 'planOnly',
     name: '只计划',
