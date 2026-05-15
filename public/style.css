@@ -657,3 +657,151 @@ button { cursor: pointer; }
   padding: 10px 12px; font-family: var(--mono); font-size: 11px;
   white-space: pre-wrap; word-break: break-word; max-height: 60vh; overflow: auto;
 }
+
+/* ===== Memory system additions ===== */
+
+/* Memory hint and decider state on approval cards */
+.approval-memory-hint {
+  margin: 6px 0;
+  padding: 6px 10px;
+  background: rgba(140, 200, 255, 0.08);
+  border-left: 3px solid #6aaeff;
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.approval-memory-hint a { color: #6aaeff; margin-left: 8px; }
+.approval-decider-bar {
+  display: flex; align-items: center; gap: 10px;
+  margin: 6px 0; padding: 8px 12px;
+  border-radius: 4px; font-size: 12px;
+}
+.approval-decider-bar.pending {
+  background: rgba(250, 200, 100, 0.10);
+  border-left: 3px solid #f5b441;
+  color: var(--text);
+}
+.approval-decider-bar.uncertain {
+  background: rgba(140, 140, 140, 0.10);
+  border-left: 3px solid #999;
+  color: var(--muted);
+}
+.approval-decider-bar.error {
+  background: rgba(255, 100, 100, 0.10);
+  border-left: 3px solid #d96565;
+  color: var(--muted);
+}
+.approval-decider-pending { box-shadow: 0 0 0 2px rgba(245, 180, 65, 0.25); }
+.approval-decider-uncertain { box-shadow: 0 0 0 2px rgba(150, 150, 150, 0.20); }
+.spinner {
+  display: inline-block; width: 14px; height: 14px;
+  border: 2px solid rgba(245, 180, 65, 0.3);
+  border-top-color: #f5b441;
+  border-radius: 50%;
+  animation: mem-spin 0.8s linear infinite;
+}
+@keyframes mem-spin { to { transform: rotate(360deg); } }
+
+/* Deposit dialog */
+.deposit-dialog { width: min(800px, 95vw); max-height: 86vh; overflow: auto; }
+.deposit-dialog::backdrop { background: rgba(0,0,0,0.5); }
+.deposit-error {
+  background: rgba(220, 100, 100, 0.10);
+  border-left: 3px solid #d96565;
+  padding: 8px 12px; margin: 8px 0; font-size: 12px; border-radius: 4px;
+}
+.deposit-section { margin: 12px 0; }
+.deposit-section h4 { margin: 0 0 8px; font-size: 13px; color: var(--muted); }
+.deposit-row {
+  display: flex; gap: 10px; padding: 10px;
+  border: 1px solid var(--border); border-radius: 6px;
+  margin-bottom: 6px; align-items: flex-start; cursor: pointer;
+}
+.deposit-row:hover { background: var(--panel-2); }
+.deposit-row input[type="checkbox"] { margin-top: 4px; }
+.deposit-row-body { flex: 1; min-width: 0; }
+.deposit-row-body code, .deposit-row-body pre, .deposit-input {
+  font-family: var(--mono); font-size: 11px;
+}
+.deposit-input {
+  margin: 6px 0 0; padding: 6px 8px;
+  background: var(--bg); border-radius: 4px; max-height: 100px;
+  overflow: auto; white-space: pre-wrap;
+}
+.deposit-edit-body {
+  width: 100%; min-height: 60px; margin-top: 6px;
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 4px; padding: 6px 8px; color: var(--text);
+  font-family: var(--font); font-size: 12px; resize: vertical;
+}
+[data-edit-title] {
+  outline: none; padding: 2px 4px; border-radius: 3px;
+}
+[data-edit-title]:focus { background: var(--panel-2); }
+
+/* Memory view */
+.memory-view {
+  display: flex; flex-direction: column; height: 100%;
+  padding: 18px 22px; overflow: auto;
+}
+.memory-toolbar {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 16px; padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.memory-body { display: flex; flex-direction: column; gap: 10px; }
+.memory-card {
+  border: 1px solid var(--border);
+  border-radius: 6px; padding: 12px 14px;
+  background: var(--panel);
+}
+.memory-card.memory-frozen { opacity: 0.65; border-style: dashed; }
+.memory-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 12px;
+}
+.memory-head code { font-family: var(--mono); font-size: 11px; }
+.memory-head .badge.workdir { background: rgba(120,180,255,0.15); color:#7fb6ff; }
+.memory-head .badge.global { background: rgba(255,180,120,0.15); color:#f5a661; }
+.memory-input {
+  margin: 8px 0 0; padding: 6px 8px;
+  background: var(--bg); border-radius: 4px;
+  max-height: 120px; overflow: auto;
+  font-family: var(--mono); font-size: 11px; white-space: pre-wrap;
+}
+.memory-body-text {
+  margin: 8px 0; line-height: 1.5; font-size: 13px; white-space: pre-wrap;
+}
+.memory-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.memory-tag {
+  padding: 2px 8px; border-radius: 10px; font-size: 11px;
+  background: rgba(140, 200, 255, 0.10); color: #7fb6ff;
+}
+.memory-triggers { font-size: 11px; margin-top: 4px; }
+.memory-toggle { display: flex; align-items: center; gap: 4px; font-size: 11px; cursor: pointer; }
+
+/* Suggest panel above prompt-form */
+.suggest-panel {
+  margin: 6px 14px; padding: 8px 12px;
+  background: rgba(140, 200, 255, 0.06);
+  border: 1px dashed #6aaeff;
+  border-radius: 6px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.suggest-panel:empty { display: none; }
+.suggest-head { font-size: 11px; }
+.suggest-card {
+  padding: 6px 8px; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 4px;
+  font-size: 12px;
+}
+.suggest-card strong { font-size: 12px; }
+
+/* Deposit toolbar appended to chat pane */
+.chat-deposit-bar {
+  display: flex; align-items: center; gap: 12px;
+  margin: 12px 0 8px; padding: 10px 14px;
+  background: var(--panel-2);
+  border: 1px dashed var(--border); border-radius: 6px;
+  position: sticky; bottom: 0;
+}

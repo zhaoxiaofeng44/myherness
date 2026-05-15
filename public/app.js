@@ -30,6 +30,13 @@ const state = {
   gitNexusImpactSymbol: '',
   gitNexusAnalyzing: false,
   gitNexusLog: [],
+  memory: null,           // { entries: [...] }
+  memoryTab: 'habit',     // 'habit' | 'experience'
+  memoryFilterScope: 'all', // 'all' | 'workdir'
+  depositDraft: null,     // { habits, experiences, distillError, turnId }
+  depositSelected: null,  // { habits: Set<idx>, experiences: Set<idx> }
+  suggestRelevant: [],    // experiences relevant to current prompt input
+  suggestDebounce: null,
 };
 
 // ===== Utility =====
@@ -108,6 +115,11 @@ async function init() {
     btn.addEventListener('click', () => switchView(btn.dataset.view));
   });
 
+  $('#depositCancel').addEventListener('click', () => $('#depositDialog').close());
+  $('#depositCommit').addEventListener('click', commitDepositSelection);
+
+  $('#promptInput').addEventListener('input', scheduleSuggestRelevant);
+
   // Load metadata
   const cwdResp = await api('/api/cwd');
   state.cwd = cwdResp.cwd;
@@ -166,6 +178,9 @@ function connectEvents() {
     state.gitNexusLog.push(data);
     if (state.gitNexusLog.length > 400) state.gitNexusLog = state.gitNexusLog.slice(-400);
     if (state.view === 'structure' && state.structureTab === 'gitnexus') renderGitNexusLog();
+  });
+  es.addEventListener('memory:updated', () => {
+    if (state.view === 'memory') loadMemory();
   });
   es.addEventListener('gitnexus:done', (e) => {
     const data = JSON.parse(e.data);
@@ -332,12 +347,33 @@ function handleSessionEvent(evt) {
       tool: evt.tool,
       input: evt.input,
       reason: evt.reason,
+      memoryHint: evt.memoryHint || null,
+      deciderState: null,
     });
   }
   if (evt.type === 'approval:resolved') {
     state.detail.pendingApprovals = state.detail.pendingApprovals.filter(
       (a) => a.id !== evt.toolUseId,
     );
+  }
+  if (evt.type === 'memory:deciding') {
+    const a = state.detail.pendingApprovals.find((x) => x.id === evt.toolUseId);
+    if (a) a.deciderState = 'pending';
+  }
+  if (evt.type === 'memory:decision-uncertain') {
+    const a = state.detail.pendingApprovals.find((x) => x.id === evt.toolUseId);
+    if (a) {
+      a.deciderState = 'uncertain';
+      a.deciderReason = evt.reason || '';
+      a.deciderConfidence = evt.confidence || 0;
+    }
+  }
+  if (evt.type === 'memory:decision-error' || evt.type === 'memory:decider-skipped') {
+    const a = state.detail.pendingApprovals.find((x) => x.id === evt.toolUseId);
+    if (a) {
+      a.deciderState = 'error';
+      a.deciderReason = evt.reason || '';
+    }
   }
 
   renderViewIfActive();
@@ -376,6 +412,10 @@ function renderViewIfActive() {
     }
   } else if (state.view === 'audit') renderAuditView();
   else if (state.view === 'policy') renderPolicyView();
+  else if (state.view === 'memory') {
+    if (!state.memory) loadMemory();
+    else renderMemoryView();
+  }
 }
 
 function switchStructureTab(tab) {
@@ -525,6 +565,8 @@ function renderChatView() {
     $('#approvalPane').innerHTML = approvals.map(renderApprovalCard).join('');
     wireApprovalCards();
   }
+
+  insertDepositButtons();
 }
 
 // Approval card rendering. AskUserQuestion gets an interactive form (option
@@ -533,10 +575,15 @@ function renderChatView() {
 // custom before approving — auto policies never silently swallow these.
 function renderApprovalCard(a) {
   if (a.tool === 'AskUserQuestion') return renderAskUserQuestionCard(a);
+  const cls = ['approval-card'];
+  if (a.deciderState === 'pending') cls.push('approval-decider-pending');
+  if (a.deciderState === 'uncertain') cls.push('approval-decider-uncertain');
   return `
-    <div class="approval-card" data-id="${a.id}">
+    <div class="${cls.join(' ')}" data-id="${a.id}">
       <div class="approval-title">⚠ 等待人工授权 · 工具：${escapeHtml(a.tool)}</div>
       <div class="muted">${escapeHtml(a.reason || '')}</div>
+      ${renderDeciderBar(a)}
+      ${renderMemoryHint(a)}
       <div class="approval-input">${escapeHtml(JSON.stringify(a.input, null, 2))}</div>
       <textarea class="approval-note" data-note="${a.id}"
         placeholder="（可选）写下要附带的备注，会随本次决定一起记录…" rows="2"></textarea>
@@ -545,6 +592,37 @@ function renderApprovalCard(a) {
         <button class="ghost-btn approve-btn" data-id="${a.id}" data-action="reject">拒绝</button>
       </div>
     </div>`;
+}
+
+function renderDeciderBar(a) {
+  if (a.deciderState === 'pending') {
+    return `<div class="approval-decider-bar pending">
+      <span class="spinner"></span>
+      <span>记忆助手判断中…</span>
+      <button class="ghost-btn cancel-decider-btn" data-id="${a.id}">我自己决定</button>
+    </div>`;
+  }
+  if (a.deciderState === 'uncertain') {
+    return `<div class="approval-decider-bar uncertain">
+      <span>🤔 记忆助手不确定（${(a.deciderConfidence ?? 0).toFixed(2)}）：${escapeHtml(a.deciderReason || '')}</span>
+    </div>`;
+  }
+  if (a.deciderState === 'error') {
+    return `<div class="approval-decider-bar error">
+      <span>记忆助手未给出建议（${escapeHtml(a.deciderReason || 'error')}）</span>
+    </div>`;
+  }
+  return '';
+}
+
+function renderMemoryHint(a) {
+  if (!a.memoryHint) return '';
+  const c = a.memoryHint.counts || {};
+  return `<div class="approval-memory-hint">
+    历次记忆：${c.approve || 0}✓ / ${c.reject || 0}✗
+    ${a.memoryHint.frozen ? '<span class="muted">（已冻结）</span>' : ''}
+    <a href="#" data-mem-link="${a.memoryHint.entryId}">查看</a>
+  </div>`;
 }
 
 function renderAskUserQuestionCard(a) {
@@ -574,10 +652,15 @@ function renderAskUserQuestionCard(a) {
       </div>`;
   }).join('');
 
+  const cls = ['approval-card', 'auq-card'];
+  if (a.deciderState === 'pending') cls.push('approval-decider-pending');
+  if (a.deciderState === 'uncertain') cls.push('approval-decider-uncertain');
   return `
-    <div class="approval-card auq-card" data-id="${a.id}">
+    <div class="${cls.join(' ')}" data-id="${a.id}">
       <div class="approval-title">？ Claude 在等你回答 · AskUserQuestion</div>
       <div class="muted">回答会写入提交记录，并自动填充到下方输入框，按发送即作为下一轮的提示发送给 Claude。</div>
+      ${renderDeciderBar(a)}
+      ${renderMemoryHint(a)}
       <div class="auq-questions">${blocks || '<div class="muted">（没有结构化问题，可在备注里直接回答）</div>'}</div>
       <textarea class="approval-note" data-note="${a.id}"
         placeholder="（可选）总体备注…" rows="2"></textarea>
@@ -616,6 +699,17 @@ function wireApprovalCards() {
   $$('.auq-submit', $('#approvalPane')).forEach((btn) => {
     btn.addEventListener('click', () => submitAskUserQuestion(btn.dataset.id));
   });
+
+  $$('.cancel-decider-btn', $('#approvalPane')).forEach((btn) => {
+    btn.addEventListener('click', () => cancelDecider(btn.dataset.id));
+  });
+
+  $$('a[data-mem-link]', $('#approvalPane')).forEach((a) => {
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      switchView('memory');
+    });
+  });
 }
 
 function readApprovalNote(id) {
@@ -627,6 +721,7 @@ function submitAskUserQuestion(id) {
   const card = $(`.approval-card[data-id="${id}"]`, $('#approvalPane'));
   if (!card) return;
   const lines = [];
+  const auqAnswers = [];
   card.querySelectorAll('.auq-question').forEach((qEl) => {
     const head = qEl.querySelector('.auq-q-text')?.textContent?.trim() || '';
     const picked = Array.from(qEl.querySelectorAll('.auq-option.selected'))
@@ -637,6 +732,7 @@ function submitAskUserQuestion(id) {
     if (picked.length) parts.push(picked.join(' / '));
     if (custom) parts.push(custom);
     if (parts.length) lines.push(`• ${head}\n  → ${parts.join(' | ')}`);
+    if (picked.length) auqAnswers.push({ question: head, picked });
   });
   const noteText = readApprovalNote(id);
   if (noteText) lines.push(`备注：${noteText}`);
@@ -648,7 +744,7 @@ function submitAskUserQuestion(id) {
     promptInput.value = existing ? `${existing}\n\n${answer}` : answer;
     promptInput.focus();
   }
-  resolveApproval(id, 'approve', answer);
+  resolveApproval(id, 'approve', answer, auqAnswers);
 }
 
 function renderChatItem(it) {
@@ -804,14 +900,26 @@ async function changePolicy() {
     body: JSON.stringify({ policyId }),
   });
 }
-async function resolveApproval(id, action, note) {
+async function resolveApproval(id, action, note, auqAnswers) {
   await api(`/api/sessions/${state.activeSessionId}/approve/${id}`, {
     method: 'POST',
     body: JSON.stringify({
       decision: action === 'approve' ? 'auto' : 'reject',
       note: note || '',
+      auqAnswers: auqAnswers || null,
     }),
   });
+}
+
+async function cancelDecider(toolUseId) {
+  if (!state.activeSessionId) return;
+  try {
+    await api(`/api/sessions/${state.activeSessionId}/approvals/${toolUseId}/cancel-decider`, {
+      method: 'POST',
+    });
+  } catch (e) {
+    console.warn('cancel decider failed', e);
+  }
 }
 
 // ===== Changes view =====
@@ -2088,6 +2196,344 @@ function renderGitNexusImpact() {
     return;
   }
   out.innerHTML = `<pre>${escapeHtml(typeof v.result === 'string' ? v.result : JSON.stringify(v.result, null, 2))}</pre>`;
+}
+
+// ===== Memory: deposit, review modal, view, suggest panel =====
+
+async function loadMemory() {
+  try {
+    const wd = state.detail?.session?.workdir;
+    const url = wd ? `/api/memory?workdir=${encodeURIComponent(wd)}` : '/api/memory';
+    const resp = await api(url);
+    state.memory = resp;
+    if (state.view === 'memory') renderMemoryView();
+  } catch (e) {
+    console.warn('loadMemory failed', e);
+  }
+}
+
+function renderMemoryView() {
+  const v = $('#memoryView');
+  const entries = state.memory?.entries || [];
+  const habits = entries.filter((e) => e.kind === 'habit');
+  const experiences = entries.filter((e) => e.kind === 'experience');
+  v.innerHTML = `
+    <div class="memory-toolbar">
+      <h2 style="margin:0">记忆库</h2>
+      <span class="muted">习惯 ${habits.length} 条 · 经验 ${experiences.length} 条</span>
+      <span style="flex:1"></span>
+      <div class="tab-group">
+        <button data-mtab="habit" class="tab-btn ${state.memoryTab === 'habit' ? 'active' : ''}">习惯</button>
+        <button data-mtab="experience" class="tab-btn ${state.memoryTab === 'experience' ? 'active' : ''}">经验</button>
+      </div>
+    </div>
+    <div class="memory-body">
+      ${state.memoryTab === 'habit' ? renderHabitList(habits) : renderExperienceList(experiences)}
+    </div>`;
+  $$('button[data-mtab]', v).forEach((b) =>
+    b.addEventListener('click', () => {
+      state.memoryTab = b.dataset.mtab;
+      renderMemoryView();
+    }),
+  );
+  wireMemoryRowActions();
+}
+
+function renderHabitList(habits) {
+  if (habits.length === 0) return '<div class="empty">还没有习惯。完成一轮任务后点击"沉淀经验"把决策沉淀进来。</div>';
+  return habits.map((h) => {
+    const c = h.counts || {};
+    return `
+      <div class="memory-card ${h.frozen ? 'memory-frozen' : ''}" data-id="${h.id}">
+        <div class="memory-head">
+          <span class="badge ${h.scope}">${h.scope === 'workdir' ? '本工程' : '全局'}</span>
+          <strong>${escapeHtml(h.tool)}</strong>
+          <code class="muted">${escapeHtml(h.keySignature)}</code>
+          <span class="muted">${c.approve || 0}✓ / ${c.reject || 0}✗</span>
+          <span class="muted">${h.lastTs ? fmtDateTime(h.lastTs) : ''}</span>
+          <span style="flex:1"></span>
+          <button class="ghost-btn mem-freeze" data-id="${h.id}" data-frozen="${h.frozen}">${h.frozen ? '解冻' : '冻结'}</button>
+          <button class="ghost-btn mem-edit" data-id="${h.id}">编辑</button>
+          <button class="ghost-btn mem-delete" data-id="${h.id}">删除</button>
+        </div>
+        <pre class="memory-input">${escapeHtml(JSON.stringify(h.inputSample, null, 2))}</pre>
+        ${h.lastNote ? `<div class="muted">最近备注：${escapeHtml(h.lastNote)}</div>` : ''}
+      </div>`;
+  }).join('');
+}
+
+function renderExperienceList(exps) {
+  if (exps.length === 0) return '<div class="empty">还没有经验。沉淀时蒸馏会产出经验卡片。</div>';
+  return exps.map((e) => {
+    return `
+      <div class="memory-card" data-id="${e.id}">
+        <div class="memory-head">
+          <span class="badge ${e.scope}">${e.scope === 'workdir' ? '本工程' : '全局'}</span>
+          <strong>${escapeHtml(e.title)}</strong>
+          <span style="flex:1"></span>
+          <label class="memory-toggle"><input type="checkbox" class="mem-tog-inj" data-id="${e.id}" ${e.enabledForInjection !== false ? 'checked' : ''}/> 注入</label>
+          <label class="memory-toggle"><input type="checkbox" class="mem-tog-dec" data-id="${e.id}" ${e.enabledForDecider !== false ? 'checked' : ''}/> 决策</label>
+          <button class="ghost-btn mem-edit" data-id="${e.id}">编辑</button>
+          <button class="ghost-btn mem-delete" data-id="${e.id}">删除</button>
+        </div>
+        <div class="memory-body-text">${escapeHtml(e.body)}</div>
+        ${(e.tags && e.tags.length) ? `<div class="memory-tags">${e.tags.map((t) => `<span class="memory-tag">${escapeHtml(t)}</span>`).join('')}</div>` : ''}
+        ${(e.triggers?.keywords?.length || e.triggers?.pathGlobs?.length || e.triggers?.tools?.length)
+          ? `<div class="muted memory-triggers">触发：${[
+              ...(e.triggers.tools || []).map((t) => `tool=${t}`),
+              ...(e.triggers.pathGlobs || []).map((p) => `path=${p}`),
+              ...(e.triggers.keywords || []).map((k) => `kw=${k}`),
+            ].map(escapeHtml).join(' · ')}</div>`
+          : ''}
+      </div>`;
+  }).join('');
+}
+
+function wireMemoryRowActions() {
+  $$('.mem-delete', $('#memoryView')).forEach((b) =>
+    b.addEventListener('click', async () => {
+      if (!confirm('删除该记忆？此操作不可撤销。')) return;
+      await api(`/api/memory/${b.dataset.id}`, { method: 'DELETE' });
+      await loadMemory();
+    }),
+  );
+  $$('.mem-freeze', $('#memoryView')).forEach((b) =>
+    b.addEventListener('click', async () => {
+      const frozen = b.dataset.frozen !== 'true';
+      await api(`/api/memory/${b.dataset.id}`, {
+        method: 'PUT', body: JSON.stringify({ frozen }),
+      });
+      await loadMemory();
+    }),
+  );
+  $$('.mem-edit', $('#memoryView')).forEach((b) =>
+    b.addEventListener('click', () => openMemoryEditDialog(b.dataset.id)),
+  );
+  $$('.mem-tog-inj', $('#memoryView')).forEach((cb) =>
+    cb.addEventListener('change', async () => {
+      await api(`/api/memory/${cb.dataset.id}`, {
+        method: 'PUT', body: JSON.stringify({ enabledForInjection: cb.checked }),
+      });
+    }),
+  );
+  $$('.mem-tog-dec', $('#memoryView')).forEach((cb) =>
+    cb.addEventListener('change', async () => {
+      await api(`/api/memory/${cb.dataset.id}`, {
+        method: 'PUT', body: JSON.stringify({ enabledForDecider: cb.checked }),
+      });
+    }),
+  );
+}
+
+function openMemoryEditDialog(id) {
+  const entry = (state.memory?.entries || []).find((e) => e.id === id);
+  if (!entry) return;
+  if (entry.kind === 'habit') {
+    const a = parseInt(prompt('approve 计数', String(entry.counts?.approve || 0)) ?? '');
+    if (Number.isNaN(a)) return;
+    const r = parseInt(prompt('reject 计数', String(entry.counts?.reject || 0)) ?? '');
+    if (Number.isNaN(r)) return;
+    api(`/api/memory/${id}`, {
+      method: 'PUT', body: JSON.stringify({ counts: { approve: a, reject: r } }),
+    }).then(() => loadMemory());
+  } else {
+    const title = prompt('标题', entry.title);
+    if (title == null) return;
+    const body = prompt('正文', entry.body);
+    if (body == null) return;
+    api(`/api/memory/${id}`, {
+      method: 'PUT', body: JSON.stringify({ title, body }),
+    }).then(() => loadMemory());
+  }
+}
+
+// ----- Deposit / review modal -----
+
+async function openDepositDialog(turnId) {
+  if (!state.activeSessionId) return;
+  state.depositDraft = null;
+  state.depositSelected = null;
+  $('#depositDialog').showModal();
+  $('#depositDialogContent').innerHTML = '<div class="muted">正在提取候选记忆 + 蒸馏经验（最多 60 秒）…</div>';
+  $('#depositCommit').disabled = true;
+  try {
+    const resp = await api(`/api/sessions/${state.activeSessionId}/turns/${turnId}/distill`, {
+      method: 'POST',
+      body: JSON.stringify({ scope: 'workdir', includeExperiences: true }),
+    });
+    state.depositDraft = { ...resp, turnId };
+    state.depositSelected = {
+      habits: new Set(resp.habits.map((_, i) => i)),
+      experiences: new Set((resp.experiences || []).map((_, i) => i)),
+    };
+    renderDepositDialog();
+  } catch (e) {
+    $('#depositDialogContent').innerHTML = `<div class="empty">提取失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderDepositDialog() {
+  const draft = state.depositDraft;
+  if (!draft) return;
+  const habits = draft.habits || [];
+  const exps = draft.experiences || [];
+  const errBlock = draft.distillError
+    ? `<div class="deposit-error">经验蒸馏失败：${escapeHtml(draft.distillError)}（仍可保存习惯）</div>`
+    : '';
+  const habitRows = habits.length === 0
+    ? '<div class="muted">本轮没有可提取的习惯（说明工具调用都被 policy 自动放行了）。</div>'
+    : habits.map((h, i) => {
+      const c = h.counts || {};
+      return `
+        <label class="deposit-row">
+          <input type="checkbox" class="deposit-h-cb" data-i="${i}" ${state.depositSelected.habits.has(i) ? 'checked' : ''}/>
+          <div class="deposit-row-body">
+            <div><strong>${escapeHtml(h.tool)}</strong> <code>${escapeHtml(h.keySignature)}</code> ${c.approve || 0}✓/${c.reject || 0}✗</div>
+            <pre class="deposit-input">${escapeHtml(JSON.stringify(h.inputSample, null, 2))}</pre>
+          </div>
+        </label>`;
+    }).join('');
+  const expRows = exps.length === 0
+    ? '<div class="muted">蒸馏没有产出经验。</div>'
+    : exps.map((e, i) => {
+      return `
+        <label class="deposit-row">
+          <input type="checkbox" class="deposit-e-cb" data-i="${i}" ${state.depositSelected.experiences.has(i) ? 'checked' : ''}/>
+          <div class="deposit-row-body">
+            <div><strong contenteditable="true" data-edit-title="${i}">${escapeHtml(e.title)}</strong></div>
+            <textarea class="deposit-edit-body" data-edit-body="${i}" rows="3">${escapeHtml(e.body)}</textarea>
+            <div class="muted">tags: ${(e.tags || []).map(escapeHtml).join(', ')}</div>
+          </div>
+        </label>`;
+    }).join('');
+  $('#depositDialogContent').innerHTML = `
+    ${errBlock}
+    <div class="deposit-section">
+      <h4>习惯候选（${habits.length}）</h4>
+      ${habitRows}
+    </div>
+    <div class="deposit-section">
+      <h4>经验候选（${exps.length}）</h4>
+      ${expRows}
+    </div>`;
+  $$('.deposit-h-cb', $('#depositDialog')).forEach((cb) =>
+    cb.addEventListener('change', () => {
+      const i = parseInt(cb.dataset.i);
+      if (cb.checked) state.depositSelected.habits.add(i);
+      else state.depositSelected.habits.delete(i);
+    }),
+  );
+  $$('.deposit-e-cb', $('#depositDialog')).forEach((cb) =>
+    cb.addEventListener('change', () => {
+      const i = parseInt(cb.dataset.i);
+      if (cb.checked) state.depositSelected.experiences.add(i);
+      else state.depositSelected.experiences.delete(i);
+    }),
+  );
+  $('#depositCommit').disabled = false;
+}
+
+async function commitDepositSelection() {
+  const draft = state.depositDraft;
+  if (!draft) return;
+  const habits = (draft.habits || []).filter((_, i) => state.depositSelected.habits.has(i));
+  // Pull live edits from textareas / contenteditable.
+  const exps = (draft.experiences || []).filter((_, i) => state.depositSelected.experiences.has(i))
+    .map((e, idx) => {
+      const trueIdx = (draft.experiences || []).indexOf(e);
+      const titleEl = $(`[data-edit-title="${trueIdx}"]`, $('#depositDialog'));
+      const bodyEl = $(`[data-edit-body="${trueIdx}"]`, $('#depositDialog'));
+      return {
+        ...e,
+        title: titleEl ? titleEl.textContent : e.title,
+        body: bodyEl ? bodyEl.value : e.body,
+      };
+    });
+  if (habits.length === 0 && exps.length === 0) {
+    $('#depositDialog').close();
+    return;
+  }
+  try {
+    const resp = await api('/api/memory/commit', {
+      method: 'POST',
+      body: JSON.stringify({ habits, experiences: exps }),
+    });
+    $('#depositDialog').close();
+    alert(`已沉淀 ${(resp.created || 0) + (resp.updated || 0)} 条`);
+    if (state.view === 'memory') loadMemory();
+  } catch (e) {
+    alert('沉淀失败：' + e.message);
+  }
+}
+
+// ----- Suggest panel (relevant experiences for next prompt) -----
+
+function scheduleSuggestRelevant() {
+  if (state.suggestDebounce) clearTimeout(state.suggestDebounce);
+  state.suggestDebounce = setTimeout(loadSuggestRelevant, 500);
+}
+
+async function loadSuggestRelevant() {
+  if (!state.activeSessionId) return;
+  const wd = state.detail?.session?.workdir;
+  const txt = $('#promptInput')?.value?.trim() || '';
+  if (!txt || !wd) {
+    state.suggestRelevant = [];
+    renderSuggestPanel();
+    return;
+  }
+  try {
+    const resp = await api(`/api/memory/relevant?workdir=${encodeURIComponent(wd)}&prompt=${encodeURIComponent(txt)}&sessionId=${encodeURIComponent(state.activeSessionId)}`);
+    state.suggestRelevant = resp.items || [];
+  } catch {
+    state.suggestRelevant = [];
+  }
+  renderSuggestPanel();
+}
+
+function renderSuggestPanel() {
+  let panel = $('#suggestPanel');
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.id = 'suggestPanel';
+    panel.className = 'suggest-panel';
+    const promptForm = $('#promptForm');
+    if (promptForm) promptForm.parentNode.insertBefore(panel, promptForm);
+  }
+  if (!state.suggestRelevant || state.suggestRelevant.length === 0) {
+    panel.innerHTML = '';
+    return;
+  }
+  panel.innerHTML = `
+    <div class="suggest-head muted">📚 相关经验（发送时会注入到提示）</div>
+    ${state.suggestRelevant.map((e) => `
+      <div class="suggest-card">
+        <strong>${escapeHtml(e.title)}</strong>
+        <div class="muted">${escapeHtml(truncate(e.body, 200))}</div>
+      </div>`).join('')}`;
+}
+
+function insertDepositButtons() {
+  if (!state.detail) return;
+  const finishedTurns = state.detail.turns.filter((t) => t.status === 'done');
+  if (finishedTurns.length === 0) return;
+  const pane = $('#chatPane');
+  if (!pane) return;
+  // Append a small bar after each turn-divider marking the END of that turn.
+  // We instead add a single floating "沉淀经验" toolbar below the chat for the
+  // most recent completed turn — simpler and works well for the common flow.
+  let toolbar = pane.querySelector('.chat-deposit-bar');
+  if (!toolbar) {
+    toolbar = document.createElement('div');
+    toolbar.className = 'chat-deposit-bar';
+    pane.appendChild(toolbar);
+  }
+  const last = finishedTurns[finishedTurns.length - 1];
+  toolbar.innerHTML = `
+    <span class="muted">最近完成的轮：${escapeHtml(last.id)}</span>
+    <button class="primary-btn deposit-btn" data-turn="${escapeHtml(last.id)}">沉淀本轮经验 →</button>`;
+  const btn = toolbar.querySelector('.deposit-btn');
+  if (btn) btn.addEventListener('click', () => openDepositDialog(btn.dataset.turn));
 }
 
 init().catch((err) => {

@@ -9,6 +9,14 @@ import { EventEmitter } from 'node:events';
 
 import { ChangeTracker, captureContents } from './changeTracker.js';
 import { evaluateToolUse, getPolicy } from './policyEngine.js';
+import {
+  keyFor as memoryKeyFor,
+  hashWorkdir,
+  lookupHabit,
+  shouldAutoApply,
+} from './memoryEngine.js';
+import { decideToolApproval, decideAskUserQuestion } from './memoryDecider.js';
+import { relevantForPrompt } from './memoryRetriever.js';
 
 let _id = 0;
 const nextId = () => `s${Date.now().toString(36)}${(_id++).toString(36)}`;
@@ -16,10 +24,12 @@ const nextId = () => `s${Date.now().toString(36)}${(_id++).toString(36)}`;
 const MAX_EVENTS = 5000;
 
 export class SessionManager extends EventEmitter {
-  constructor({ store } = {}) {
+  constructor({ store, memoryStore, deciderQueue } = {}) {
     super();
     this.sessions = new Map();
     this.store = store || null;
+    this.memoryStore = memoryStore || null;
+    this.deciderQueue = deciderQueue || null;
   }
 
   list() {
@@ -48,6 +58,8 @@ export class SessionManager extends EventEmitter {
       bus: this,
     });
     session._store = this.store;
+    session._memoryStore = this.memoryStore;
+    session._deciderQueue = this.deciderQueue;
     this.sessions.set(session.id, session);
     this.emit('session:created', session.summary());
     this.store?.scheduleSave(session);
@@ -77,6 +89,8 @@ export class SessionManager extends EventEmitter {
       bus: this,
     });
     session._store = this.store;
+    session._memoryStore = this.memoryStore;
+    session._deciderQueue = this.deciderQueue;
 
     // Restore audit/state fields verbatim.
     session.createdAt = persisted.createdAt;
@@ -209,7 +223,8 @@ class Session {
     if (this.claudeSessionId) {
       args.push('--resume', this.claudeSessionId);
     }
-    args.push(prompt);
+    const augmented = this._buildAugmentedPrompt(prompt);
+    args.push(augmented);
 
     let child;
     try {
@@ -402,6 +417,33 @@ class Session {
   _handleToolUse(block) {
     const policy = getPolicy(this.policyId);
     const decision = evaluateToolUse(policy, block, { workdir: this.workdir });
+
+    // Path A: deterministic fast-path. If we have a high-confidence habit
+    // (≥5 consistent approves with no rejects in the recent window), skip the
+    // LLM decider entirely and resolve as if the user pre-approved.
+    let memoryHint = null;
+    let appliedFastPath = null;
+    if (decision.decision === 'manual' && this._memoryStore?.entries?.length) {
+      const wdHash = hashWorkdir(this.workdir);
+      const { keySignature } = memoryKeyFor(block.name, block.input, this.workdir);
+      const habit = lookupHabit(this._memoryStore.entries, { keySignature, workdirHash: wdHash });
+      if (habit) {
+        const counts = habit.counts || { approve: 0, reject: 0 };
+        memoryHint = {
+          entryId: habit.id,
+          counts,
+          lastDecision: habit.lastDecision,
+          frozen: !!habit.frozen,
+        };
+        const verdict = shouldAutoApply(habit);
+        if (verdict === 'approve' || verdict === 'reject') {
+          decision.decision = verdict === 'approve' ? 'auto' : 'reject';
+          decision.reason = `记忆命中（${counts.approve}✓/${counts.reject}✗，fast-path）：${decision.reason || ''}`;
+          appliedFastPath = { entryId: habit.id, verdict, counts };
+        }
+      }
+    }
+
     const record = {
       id: block.id,
       turnId: this.activeTurn?.id,
@@ -411,44 +453,228 @@ class Session {
       reason: decision.reason,
       ruleMatched: decision.rule?.match || null,
       timestamp: Date.now(),
+      memoryHint,
+      deciderState: null, // 'pending' | 'decided' | 'uncertain' | 'cancelled' | 'error' | 'skipped'
     };
     this.tools.push(record);
     this._record({ type: 'tool:use', ...record });
 
-    if (decision.decision === 'manual') {
-      this.pendingApprovals.set(block.id, record);
+    if (appliedFastPath) {
       this._record({
-        type: 'approval:pending',
+        type: 'memory:applied',
+        path: 'fast',
         toolUseId: block.id,
-        tool: block.name,
-        input: block.input,
-        reason: decision.reason,
+        entryId: appliedFastPath.entryId,
+        verdict: appliedFastPath.verdict,
+        counts: appliedFastPath.counts,
       });
-      this.status = 'waiting';
-      this._broadcastSummary();
+      return;
     }
+
+    if (decision.decision !== 'manual') return;
+
+    // Manual: queue the approval card.
+    this.pendingApprovals.set(block.id, record);
+    this._record({
+      type: 'approval:pending',
+      toolUseId: block.id,
+      tool: block.name,
+      input: block.input,
+      reason: decision.reason,
+      memoryHint,
+    });
+    this.status = 'waiting';
+    this._broadcastSummary();
+
+    // Path B: kick off async LLM decider if memory is available.
+    this._maybeKickoffDecider(record);
+  }
+
+  _maybeKickoffDecider(record) {
+    if (!this._memoryStore || !this._deciderQueue) return;
+    if (!Array.isArray(this._memoryStore.entries) || this._memoryStore.entries.length === 0) return;
+
+    const turnId = record.turnId;
+    const acquired = this._deciderQueue.acquire({
+      sessionId: this.id,
+      turnId,
+      toolUseId: record.id,
+    });
+    if (!acquired.ok) {
+      record.deciderState = 'skipped';
+      this._record({
+        type: 'memory:decider-skipped',
+        toolUseId: record.id,
+        reason: acquired.reason,
+      });
+      return;
+    }
+
+    record.deciderState = 'pending';
+    this._record({
+      type: 'memory:deciding',
+      toolUseId: record.id,
+      tool: record.tool,
+    });
+
+    const turn = this.activeTurn || this.turns.find((t) => t.id === turnId);
+    const entries = this._memoryStore.entries;
+    const sessionShape = this; // pass `this` — decider only reads workdir + policyId
+
+    acquired.run(async (signal) => {
+      try {
+        let verdict;
+        if (record.tool === 'AskUserQuestion') {
+          verdict = await decideAskUserQuestion({
+            entries, session: sessionShape, turn,
+            input: record.input, signal,
+          });
+        } else {
+          verdict = await decideToolApproval({
+            entries, session: sessionShape, turn,
+            tool: record.tool, input: record.input,
+            decisionReason: record.reason, signal,
+          });
+        }
+        return verdict;
+      } catch (e) {
+        return { error: e.message };
+      }
+    }).then((verdict) => this._handleDeciderResult(record, verdict))
+      .catch((e) => this._handleDeciderResult(record, { error: e.message }));
+  }
+
+  _handleDeciderResult(record, verdict) {
+    // The user may have cancelled, manually resolved, or the turn ended in
+    // the meantime — bail if the approval is no longer pending.
+    if (!this.pendingApprovals.has(record.id)) return;
+
+    if (!verdict || verdict.error || verdict.skipped) {
+      record.deciderState = verdict?.skipped ? 'skipped' : 'error';
+      this._record({
+        type: verdict?.skipped ? 'memory:decider-skipped' : 'memory:decision-error',
+        toolUseId: record.id,
+        reason: verdict?.error || verdict?.skipped || 'unknown',
+      });
+      this._broadcastSummary();
+      return;
+    }
+
+    const { decision, confidence, reason, usedMemoryIds } = verdict;
+    const isAUQ = record.tool === 'AskUserQuestion';
+    const expected = isAUQ
+      ? collectAUQLabels(record.input)
+      : ['approve', 'reject'];
+    const isConfident = decision !== 'uncertain' && confidence >= 0.7 && expected.includes(decision);
+
+    if (!isConfident) {
+      record.deciderState = 'uncertain';
+      record.deciderReason = reason || '';
+      this._record({
+        type: 'memory:decision-uncertain',
+        toolUseId: record.id,
+        confidence: confidence || 0,
+        reason: reason || '',
+        usedMemoryIds: usedMemoryIds || [],
+      });
+      this._broadcastSummary();
+      return;
+    }
+
+    // Confident — auto-resolve.
+    if (isAUQ) {
+      const synthesizedNote = `[记忆助手自动作答 confidence=${confidence.toFixed(2)}] ${decision}`;
+      const auqAnswers = synthesizeAUQAnswers(record.input, decision);
+      this._record({
+        type: 'memory:decided',
+        toolUseId: record.id,
+        decision,
+        confidence,
+        reason: reason || '',
+        usedMemoryIds: usedMemoryIds || [],
+      });
+      this.resolveApproval(record.id, 'auto', synthesizedNote, { auqAnswers });
+    } else {
+      const decisionResolved = decision === 'approve' ? 'auto' : 'reject';
+      this._record({
+        type: 'memory:decided',
+        toolUseId: record.id,
+        decision: decisionResolved,
+        confidence,
+        reason: reason || '',
+        usedMemoryIds: usedMemoryIds || [],
+      });
+      this.resolveApproval(record.id, decisionResolved,
+        `[记忆助手自动决定 confidence=${confidence.toFixed(2)}] ${reason || ''}`);
+    }
+  }
+
+  // Build a prompt augmented with relevant experience memories. The original
+  // prompt is preserved verbatim after the <memory> block so Claude can
+  // distinguish guidance from the actual task.
+  _buildAugmentedPrompt(prompt) {
+    if (!this._memoryStore?.entries?.length) return prompt;
+    let memos;
+    try {
+      const modifiedPaths = (this.changes || [])
+        .flatMap((c) => (c.files || []).map((f) => f.relPath))
+        .filter(Boolean);
+      memos = relevantForPrompt(this._memoryStore.entries, {
+        workdir: this.workdir,
+        prompt,
+        modifiedPaths,
+      });
+    } catch {
+      return prompt;
+    }
+    if (!memos || memos.length === 0) return prompt;
+    const block = memos.map((m) => `- 【${m.title}】 ${m.body}`).join('\n');
+    this._record({
+      type: 'prompt:augmented',
+      injectedIds: memos.map((m) => m.id),
+    });
+    return `<memory>\n${block}\n</memory>\n\n${prompt}`;
   }
 
   // The user may resolve a pending manual approval from the UI. Because the
   // CLI already executed (or was prevented) by --permission-mode, this resolve
   // is informational/audit-only. We still track it so the UX is honest.
-  resolveApproval(toolUseId, decision, note) {
+  resolveApproval(toolUseId, decision, note, extra = {}) {
     const rec = this.pendingApprovals.get(toolUseId);
     if (!rec) return false;
     this.pendingApprovals.delete(toolUseId);
     rec.decision = decision; // 'auto' (approved) | 'reject'
     rec.manualResolution = decision;
     rec.manualNote = note || '';
+    if (extra && extra.auqAnswers) rec.auqAnswers = extra.auqAnswers;
     this._record({
       type: 'approval:resolved',
       toolUseId,
       decision,
       note: note || '',
+      auqAnswers: extra && extra.auqAnswers ? extra.auqAnswers : undefined,
     });
     if (this.pendingApprovals.size === 0 && this.status === 'waiting') {
       this.status = this.activeChild ? 'running' : 'idle';
     }
     this._broadcastSummary();
+    return true;
+  }
+
+  // Cancel an in-flight decider and let the user take over.
+  cancelDecider(toolUseId) {
+    if (!this._deciderQueue) return false;
+    this._deciderQueue.cancel(toolUseId);
+    const rec = this.pendingApprovals.get(toolUseId);
+    if (rec) {
+      rec.deciderState = 'cancelled';
+      this._record({
+        type: 'memory:decision-error',
+        toolUseId,
+        reason: 'user-cancelled',
+      });
+      this._broadcastSummary();
+    }
     return true;
   }
 
@@ -501,6 +727,10 @@ class Session {
 
     if (turn) this._record({ type: 'turn:end', turnId: turn.id, status: turn.status });
 
+    if (turn && this._deciderQueue) {
+      this._deciderQueue.resetTurn(this.id, turn.id);
+    }
+
     this.activeTurn = null;
     this.status = reason === 'error' ? 'error' : 'idle';
     this._broadcastSummary();
@@ -519,6 +749,32 @@ class Session {
   _broadcastSummary() {
     this.bus.emit('session:updated', this.summary());
   }
+}
+
+function collectAUQLabels(input) {
+  const qs = Array.isArray(input?.questions) ? input.questions : [];
+  const out = [];
+  for (const q of qs) {
+    if (Array.isArray(q.options)) {
+      for (const o of q.options) if (o.label) out.push(o.label);
+    }
+  }
+  return out;
+}
+
+// When the decider picks a single label, build the auqAnswers payload that
+// approval-commit/learn-side code expects. We assign the picked label to the
+// first question containing it (handles single-question AUQ which is the
+// dominant case).
+function synthesizeAUQAnswers(input, pickedLabel) {
+  const qs = Array.isArray(input?.questions) ? input.questions : [];
+  for (const q of qs) {
+    const opts = Array.isArray(q.options) ? q.options : [];
+    if (opts.some((o) => o.label === pickedLabel)) {
+      return [{ question: q.question || '', picked: [pickedLabel] }];
+    }
+  }
+  return [];
 }
 
 function extractText(content) {

@@ -8,11 +8,17 @@ import { fileURLToPath } from 'node:url';
 
 import { SessionManager } from './src/sessionManager.js';
 import { SessionStore } from './src/sessionStore.js';
+import { MemoryStore } from './src/memoryStore.js';
+import { DeciderQueue } from './src/deciderQueue.js';
 import { PRESET_POLICIES, getPolicy } from './src/policyEngine.js';
 import { scanStructure, annotateChanges } from './src/structure.js';
 import { buildDesignGraph } from './src/designGraph.js';
 import { buildCodeMap } from './src/codeMap.js';
 import * as gitnexus from './src/gitnexus.js';
+import { extractHabits } from './src/habitExtractor.js';
+import { distillExperiences } from './src/memoryDistiller.js';
+import { mergeHabit, mergeExperience, hashWorkdir } from './src/memoryEngine.js';
+import { relevantForPrompt } from './src/memoryRetriever.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -20,8 +26,12 @@ const PORT = parseInt(process.env.PORT || '4477', 10);
 
 const DATA_DIR =
   process.env.CLAUDE_CONSOLE_DATA || path.join(__dirname, '.claude-console', 'sessions');
+const MEMORY_FILE = path.join(path.dirname(DATA_DIR), 'memory.json');
 const store = new SessionStore({ dir: DATA_DIR });
-const manager = new SessionManager({ store });
+const memoryStore = new MemoryStore({ file: MEMORY_FILE });
+memoryStore.load();
+const deciderQueue = new DeciderQueue();
+const manager = new SessionManager({ store, memoryStore, deciderQueue });
 for (const persisted of store.loadAll()) {
   try {
     manager.hydrate(persisted);
@@ -88,6 +98,92 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === '/api/cwd' && req.method === 'GET')
       return json(res, 200, { cwd: process.cwd() });
+
+    // ===== Memory routes =====
+    if (pathname === '/api/memory' && req.method === 'GET') {
+      const wd = parsed.query.workdir;
+      const kind = parsed.query.kind;
+      let entries = memoryStore.entries.slice();
+      if (kind) entries = entries.filter((e) => e.kind === kind);
+      if (wd) {
+        const wdHash = hashWorkdir(wd);
+        entries = entries.filter((e) => e.scope === 'global' || e.workdirHash === wdHash);
+      }
+      return json(res, 200, { entries });
+    }
+
+    if (pathname === '/api/memory/commit' && req.method === 'POST') {
+      const body = await readJson(req);
+      const habits = Array.isArray(body.habits) ? body.habits : [];
+      const experiences = Array.isArray(body.experiences) ? body.experiences : [];
+      const created = [];
+      const updated = [];
+      for (const h of habits) {
+        const result = mergeHabit(memoryStore.entries, h);
+        if (result.action === 'created') created.push(result.entry);
+        else updated.push(result.entry);
+      }
+      for (const e of experiences) {
+        const result = mergeExperience(memoryStore.entries, e);
+        created.push(result.entry);
+      }
+      memoryStore.scheduleSave();
+      broadcast('memory:updated', { commitCount: habits.length + experiences.length });
+      return json(res, 200, { ok: true, created: created.length, updated: updated.length });
+    }
+
+    if (pathname === '/api/memory/relevant' && req.method === 'GET') {
+      const wd = parsed.query.workdir || '';
+      const promptText = parsed.query.prompt || '';
+      const session = parsed.query.sessionId ? manager.get(parsed.query.sessionId) : null;
+      const modifiedPaths = session
+        ? (session.changes || []).flatMap((c) => (c.files || []).map((f) => f.relPath)).filter(Boolean)
+        : [];
+      const items = relevantForPrompt(memoryStore.entries, {
+        workdir: wd, prompt: promptText, modifiedPaths,
+      });
+      return json(res, 200, { items });
+    }
+
+    const memSingleMatch = pathname.match(/^\/api\/memory\/([^/]+)$/);
+    if (memSingleMatch) {
+      const id = memSingleMatch[1];
+      const entry = memoryStore.entries.find((e) => e.id === id);
+      if (!entry && req.method !== 'POST') return json(res, 404, { error: '记忆不存在' });
+      if (req.method === 'PUT') {
+        const body = await readJson(req);
+        if (body.title !== undefined) entry.title = String(body.title).slice(0, 200);
+        if (body.body !== undefined) entry.body = String(body.body).slice(0, 4000);
+        if (Array.isArray(body.tags)) entry.tags = body.tags.map(String).slice(0, 10);
+        if (body.triggers && typeof body.triggers === 'object') {
+          entry.triggers = {
+            tools: Array.isArray(body.triggers.tools) ? body.triggers.tools.map(String).slice(0, 10) : (entry.triggers?.tools || []),
+            pathGlobs: Array.isArray(body.triggers.pathGlobs) ? body.triggers.pathGlobs.map(String).slice(0, 10) : (entry.triggers?.pathGlobs || []),
+            keywords: Array.isArray(body.triggers.keywords) ? body.triggers.keywords.map(String).slice(0, 20) : (entry.triggers?.keywords || []),
+          };
+        }
+        if (typeof body.weight === 'number') entry.weight = body.weight;
+        if (body.counts && typeof body.counts === 'object') {
+          entry.counts = {
+            approve: Number(body.counts.approve) || 0,
+            reject: Number(body.counts.reject) || 0,
+          };
+        }
+        if (typeof body.frozen === 'boolean') entry.frozen = body.frozen;
+        if (typeof body.enabledForInjection === 'boolean') entry.enabledForInjection = body.enabledForInjection;
+        if (typeof body.enabledForDecider === 'boolean') entry.enabledForDecider = body.enabledForDecider;
+        entry.updatedAt = Date.now();
+        memoryStore.scheduleSave();
+        broadcast('memory:updated', { entry });
+        return json(res, 200, { entry });
+      }
+      if (req.method === 'DELETE') {
+        memoryStore.remove(id);
+        broadcast('memory:updated', { removedId: id });
+        return json(res, 200, { ok: true });
+      }
+      return json(res, 405, { error: 'method not allowed' });
+    }
 
     if (pathname === '/api/events' && req.method === 'GET') {
       res.writeHead(200, {
@@ -207,8 +303,38 @@ const server = http.createServer(async (req, res) => {
       const approveMatch = rest.match(/^\/approve\/([^/]+)$/);
       if (approveMatch && req.method === 'POST') {
         const body = await readJson(req);
-        const ok = session.resolveApproval(approveMatch[1], body.decision, body.note);
+        const ok = session.resolveApproval(approveMatch[1], body.decision, body.note, {
+          auqAnswers: Array.isArray(body.auqAnswers) ? body.auqAnswers : null,
+        });
         return json(res, ok ? 200 : 404, { ok });
+      }
+
+      const cancelDeciderMatch = rest.match(/^\/approvals\/([^/]+)\/cancel-decider$/);
+      if (cancelDeciderMatch && req.method === 'POST') {
+        const ok = session.cancelDecider(cancelDeciderMatch[1]);
+        return json(res, ok ? 200 : 404, { ok });
+      }
+
+      const distillMatch = rest.match(/^\/turns\/([^/]+)\/distill$/);
+      if (distillMatch && req.method === 'POST') {
+        const turnId = distillMatch[1];
+        const body = await readJson(req).catch(() => ({}));
+        const scope = body.scope === 'global' ? 'global' : 'workdir';
+        const habits = extractHabits({ session, turnId, scope });
+        let experiences = [];
+        let distillError = null;
+        if (body.includeExperiences !== false) {
+          const result = await distillExperiences({ session, turnId });
+          if (result.error) distillError = result.error;
+          else experiences = result.items.map((it) => ({
+            ...it,
+            scope,
+            workdirHash: scope === 'workdir' ? hashWorkdir(session.workdir) : null,
+            sourceSession: session.id,
+            sourceTurn: turnId,
+          }));
+        }
+        return json(res, 200, { habits, experiences, distillError });
       }
 
       if (rest === '/gitnexus/status' && req.method === 'GET') {
@@ -303,20 +429,27 @@ server.listen(PORT, () => {
   console.log(`Claude Code Console running at http://localhost:${PORT}`);
   console.log(`Working directory: ${process.cwd()}`);
   console.log(`Session data dir: ${DATA_DIR}`);
+  console.log(`Memory file: ${MEMORY_FILE}`);
 });
 
 let shuttingDown = false;
 function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
+  try { deciderQueue.abortAll(); } catch {}
   for (const s of manager.sessions.values()) {
     try { s.cancel(); } catch {}
   }
   // Defer one tick so any in-flight stdout `data` callbacks finish first.
   setImmediate(() => {
-    try { store.flushAll(manager); } finally { process.exit(0); }
+    try { store.flushAll(manager); } catch {}
+    try { memoryStore.flush(); } catch {}
+    process.exit(0);
   });
 }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
-process.on('beforeExit', () => store.flushAll(manager));
+process.on('beforeExit', () => {
+  try { store.flushAll(manager); } catch {}
+  try { memoryStore.flush(); } catch {}
+});

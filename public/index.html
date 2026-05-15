@@ -29,6 +29,7 @@
             <li><button data-view="structure" class="nav-btn">结构图</button></li>
             <li><button data-view="audit" class="nav-btn">审计回放</button></li>
             <li><button data-view="policy" class="nav-btn">策略</button></li>
+            <li><button data-view="memory" class="nav-btn">记忆</button></li>
           </ul>
         </nav>
 
@@ -118,8 +119,23 @@
         <section class="view hidden" id="view-policy">
           <div id="policyView" class="policy-view"></div>
         </section>
+
+        <section class="view hidden" id="view-memory">
+          <div id="memoryView" class="memory-view"></div>
+        </section>
       </main>
     </div>
+
+    <dialog id="depositDialog" class="dialog deposit-dialog">
+      <div id="depositDialogBody">
+        <h3>沉淀本轮经验</h3>
+        <div id="depositDialogContent" class="muted">正在提取候选记忆…</div>
+        <div class="dialog-actions">
+          <button type="button" id="depositCancel" class="ghost-btn">取消</button>
+          <button type="button" id="depositCommit" class="primary-btn" disabled>确认沉淀</button>
+        </div>
+      </div>
+    </dialog>
 
     <dialog id="newSessionDialog" class="dialog">
       <form method="dialog" id="newSessionForm">
