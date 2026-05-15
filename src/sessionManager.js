@@ -100,7 +100,7 @@ export class SessionManager extends EventEmitter {
       // Re-snapshot so the next turn diffs against the post-restart state.
       session.changeTracker.takeSnapshot();
       let status = persisted.status;
-      if (status === 'running' || status === 'waiting') status = 'idle';
+      if (status === 'running' || status === 'waiting' || status === 'cancelling') status = 'idle';
       session.status = status || 'idle';
     } else {
       session.status = 'error';
@@ -213,10 +213,16 @@ class Session {
 
     let child;
     try {
+      // detached: true makes the child a process-group leader, so a single
+      // process.kill(-pid, sig) tears down `claude` and any tool subprocesses
+      // (Bash, MCP servers, etc.) it spawned. Without this, only the immediate
+      // child dies and the user sees "停止" do nothing because Bash keeps
+      // running in the background.
       child = spawn('claude', args, {
         cwd: this.workdir,
         env: { ...process.env, FORCE_COLOR: '0' },
         stdio: ['ignore', 'pipe', 'pipe'],
+        detached: true,
       });
     } catch (e) {
       this._record({ type: 'turn:error', turnId, error: e.message });
@@ -228,6 +234,11 @@ class Session {
       throw e;
     }
     this.activeChild = child;
+    this._cancelRequested = false;
+    if (this._killEscalateTimer) {
+      clearTimeout(this._killEscalateTimer);
+      this._killEscalateTimer = null;
+    }
 
     // Pre-capture baselines for any files that may be edited so we can show
     // diffs even after Claude writes them.
@@ -254,22 +265,57 @@ class Session {
       this._endTurn('error', err.message);
     });
 
-    child.on('close', (code) => {
+    child.on('close', (code, signal) => {
+      if (this._killEscalateTimer) {
+        clearTimeout(this._killEscalateTimer);
+        this._killEscalateTimer = null;
+      }
       if (stdoutBuf.trim()) this._handleStreamLine(stdoutBuf.trim());
-      if (code !== 0 && stderrBuf) {
+      // If the user clicked stop, mark the turn cancelled rather than errored —
+      // a non-zero exit from a SIGTERM/SIGKILL is expected, not a real failure.
+      let outcome;
+      if (this._cancelRequested) outcome = 'cancelled';
+      else if (code === 0) outcome = 'done';
+      else outcome = 'error';
+      if (outcome === 'error' && stderrBuf) {
         this._record({ type: 'cli:stderr', text: stderrBuf.trim() });
       }
-      this._afterTurnFinish(code === 0 ? 'done' : 'error');
+      this._afterTurnFinish(outcome, signal);
     });
 
     return turn;
   }
 
   cancel() {
-    if (this.activeChild) {
-      try {
-        this.activeChild.kill('SIGTERM');
-      } catch {}
+    if (!this.activeChild) return false;
+    if (this._cancelRequested) return true; // idempotent
+    this._cancelRequested = true;
+    this.status = 'cancelling';
+    this._record({ type: 'turn:cancel', turnId: this.activeTurn?.id });
+    this._broadcastSummary();
+    this._signalChildGroup('SIGTERM');
+    // Escalate to SIGKILL if the process group is still alive after 2.5s.
+    // Cleared in child.on('close').
+    this._killEscalateTimer = setTimeout(() => {
+      if (this.activeChild) {
+        this._signalChildGroup('SIGKILL');
+      }
+    }, 2500);
+    return true;
+  }
+
+  _signalChildGroup(sig) {
+    const child = this.activeChild;
+    if (!child || child.pid == null) return;
+    // Kill the whole process group (negative pid) so subprocesses go too.
+    // Falls back to a direct kill if the group call fails (e.g. ESRCH means
+    // the process is already gone — nothing to do).
+    try {
+      process.kill(-child.pid, sig);
+    } catch (e) {
+      if (e.code !== 'ESRCH') {
+        try { child.kill(sig); } catch {}
+      }
     }
   }
 

@@ -79,12 +79,28 @@ export function getPolicy(id) {
   return PRESET_POLICIES[id] || PRESET_POLICIES.balanced;
 }
 
+// Tools that ALWAYS need a human in the loop, regardless of policy. These
+// exist precisely to ask the user something, so auto-approving them defeats
+// their purpose — Claude would proceed without ever seeing the answer.
+// Hardcoded as a global override so no policy preset can accidentally bypass.
+const ALWAYS_MANUAL_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode']);
+
 // Evaluate a tool_use event against a policy.
 // Returns { decision: 'auto'|'manual'|'reject', reason, rule }
 export function evaluateToolUse(policy, toolUse, ctx = {}) {
   const toolName = toolUse.name || toolUse.tool || 'Unknown';
   const input = toolUse.input || {};
   const workdir = ctx.workdir;
+
+  if (ALWAYS_MANUAL_TOOLS.has(toolName)) {
+    return {
+      decision: 'manual',
+      reason: toolName === 'AskUserQuestion'
+        ? 'Claude 需要你回答问题（始终人工处理）'
+        : '需要你确认计划（始终人工处理）',
+      rule: { match: `tool:${toolName}`, decision: 'manual', reason: 'always-manual', builtin: true },
+    };
+  }
 
   for (const rule of policy.rules) {
     const m = rule.match;

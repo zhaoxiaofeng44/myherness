@@ -81,6 +81,7 @@ async function init() {
     }
   });
   $('#cancelBtn').addEventListener('click', cancelTurn);
+  $('#newTaskBtn').addEventListener('click', startNextTask);
   $('#policySelect').addEventListener('change', changePolicy);
   $('#refreshStructureBtn').addEventListener('click', () => {
     if (state.structureTab === 'tree') loadStructure();
@@ -396,6 +397,8 @@ function renderTopbar() {
     $('#statusPill').textContent = '';
     $('#statusPill').className = 'status-pill';
     $('#cancelBtn').disabled = true;
+    $('#cancelBtn').textContent = '停止';
+    $('#newTaskBtn').disabled = true;
     return;
   }
   const s = state.detail.session;
@@ -403,11 +406,29 @@ function renderTopbar() {
   $('#sessionMeta').textContent = `${s.workdir} · ${s.turnCount} 轮 · ${s.changeCount} 个变更文件`;
   $('#statusPill').textContent = labelFor(s.status);
   $('#statusPill').className = `status-pill ${s.status}`;
-  $('#cancelBtn').disabled = s.status !== 'running' && s.status !== 'waiting';
+  // Stop button: enabled while a turn is in flight (including waiting on
+  // approval). While 'cancelling', show progress text and disable to avoid
+  // re-clicks racing with the kill escalation.
+  const cancelBtn = $('#cancelBtn');
+  if (s.status === 'cancelling') {
+    cancelBtn.disabled = true;
+    cancelBtn.textContent = '停止中…';
+  } else {
+    cancelBtn.disabled = s.status !== 'running' && s.status !== 'waiting';
+    cancelBtn.textContent = '停止';
+  }
+  // Next task: enabled only when nothing is running. The session must also
+  // not be 'ended' permanently — but ended is fine because we're spinning up
+  // a fresh session anyway.
+  $('#newTaskBtn').disabled = s.status === 'running' || s.status === 'waiting' || s.status === 'cancelling';
   $('#policySelect').value = s.policyId;
 }
 function labelFor(status) {
-  return { idle: '空闲', running: '运行中', waiting: '等待授权', error: '错误', ended: '已结束' }[status] || status;
+  return {
+    idle: '空闲', running: '运行中', waiting: '等待授权',
+    cancelling: '停止中', cancelled: '已取消',
+    error: '错误', ended: '已结束',
+  }[status] || status;
 }
 
 // ===== Chat view =====
@@ -475,6 +496,10 @@ function renderChatView() {
       items.push({ kind: 'system', text: 'stderr: ' + e.text, ts: e.ts, error: true });
     } else if (e.type === 'turn:error') {
       items.push({ kind: 'system', text: '错误: ' + e.error, ts: e.ts, error: true });
+    } else if (e.type === 'turn:cancel') {
+      items.push({ kind: 'system', text: '已请求停止…', ts: e.ts });
+    } else if (e.type === 'turn:end' && e.status === 'cancelled') {
+      items.push({ kind: 'system', text: '本轮已取消', ts: e.ts });
     } else if (e.type === 'system' && e.subtype === 'init') {
       items.push({
         kind: 'system',
@@ -650,7 +675,11 @@ function renderChatItem(it) {
       manual: '等待人工',
       reject: '已拒绝',
     }[it.decision] || it.decision;
-    const inputStr = JSON.stringify(it.input, null, 2);
+    const body = it.tool === 'AskUserQuestion'
+      ? renderAskUserQuestionPreview(it.input)
+      : it.tool === 'ExitPlanMode'
+        ? renderExitPlanModePreview(it.input)
+        : `<div class="content">${escapeHtml(truncate(JSON.stringify(it.input, null, 2), 1200))}</div>`;
     return `
       <div class="msg tool ${it.decision}">
         <div class="avatar">⚙</div>
@@ -661,7 +690,7 @@ function renderChatItem(it) {
             ${it.reason ? `<span class="muted">${escapeHtml(it.reason)}</span>` : ''}
             <span class="muted" style="margin-left:auto">${fmtTime(it.ts)}</span>
           </div>
-          <div class="content">${escapeHtml(truncate(inputStr, 1200))}</div>
+          ${body}
         </div>
       </div>`;
   }
@@ -679,6 +708,41 @@ function renderChatItem(it) {
   }
   return '';
 }
+// Pretty-print the AskUserQuestion tool input as cards instead of raw JSON,
+// so the chat log stays readable when scrolling history.
+function renderAskUserQuestionPreview(input) {
+  const questions = Array.isArray(input?.questions) ? input.questions : [];
+  if (questions.length === 0) {
+    return `<div class="content">${escapeHtml(JSON.stringify(input, null, 2))}</div>`;
+  }
+  const blocks = questions.map((q) => {
+    const opts = Array.isArray(q.options) ? q.options : [];
+    const optList = opts.map((o) => `
+      <li>
+        <span class="auq-opt-label">${escapeHtml(o.label || '')}</span>
+        ${o.description ? `<span class="auq-opt-desc muted">${escapeHtml(o.description)}</span>` : ''}
+      </li>`).join('');
+    return `
+      <div class="auq-preview-q">
+        <div class="auq-q-head">
+          ${q.header ? `<span class="auq-header">${escapeHtml(q.header)}</span>` : ''}
+          <span class="auq-q-text">${escapeHtml(q.question || '')}</span>
+          ${q.multiSelect ? '<span class="auq-multi">可多选</span>' : ''}
+        </div>
+        ${optList ? `<ul class="auq-opt-list">${optList}</ul>` : ''}
+      </div>`;
+  }).join('');
+  return `<div class="auq-preview">${blocks}</div>`;
+}
+
+function renderExitPlanModePreview(input) {
+  const plan = typeof input?.plan === 'string' ? input.plan : '';
+  if (!plan) {
+    return `<div class="content">${escapeHtml(JSON.stringify(input, null, 2))}</div>`;
+  }
+  return `<div class="content auq-plan">${escapeHtml(truncate(plan, 4000))}</div>`;
+}
+
 function msgBlock(role, name, content, ts, extraCls = '') {
   return `
     <div class="msg ${role} ${extraCls}">
@@ -709,6 +773,28 @@ async function cancelTurn() {
   try {
     await api(`/api/sessions/${state.activeSessionId}/cancel`, { method: 'POST' });
   } catch (e) {}
+}
+// Spin up a fresh session reusing the current session's workdir + policy.
+// Useful when one task wraps up and the user wants a clean conversation
+// context (no --resume) for the next task — skips the dialog.
+async function startNextTask() {
+  if (!state.detail) return;
+  const cur = state.detail.session;
+  const baseName = (cur.name || '').replace(/\s*#\d+$/, '');
+  const nextNum = state.sessions.filter((s) => (s.name || '').startsWith(baseName)).length + 1;
+  const body = {
+    name: `${baseName} #${nextNum}`,
+    workdir: cur.workdir,
+    policyId: cur.policyId,
+  };
+  try {
+    const resp = await api('/api/sessions', { method: 'POST', body: JSON.stringify(body) });
+    await refreshSessions();
+    selectSession(resp.session.id);
+    $('#promptInput').focus();
+  } catch (err) {
+    alert('开启下一任务失败：' + err.message);
+  }
 }
 async function changePolicy() {
   if (!state.activeSessionId) return;

@@ -134,6 +134,8 @@ button { cursor: pointer; }
 .status-pill.idle { color: var(--muted); }
 .status-pill.running { color: var(--accent); border-color: var(--accent); }
 .status-pill.waiting { color: var(--yellow); border-color: var(--yellow); }
+.status-pill.cancelling { color: var(--orange); border-color: var(--orange); }
+.status-pill.cancelled { color: var(--muted); }
 .status-pill.error { color: var(--red); border-color: var(--red); }
 .status-pill.ended { color: var(--muted); }
 
@@ -220,6 +222,34 @@ button { cursor: pointer; }
   font-family: -apple-system, "PingFang SC", sans-serif;
 }
 
+/* AskUserQuestion preview inside the chat tool log (read-only history). */
+.auq-preview {
+  display: flex; flex-direction: column; gap: 8px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 6px; padding: 10px 12px;
+}
+.auq-preview-q { padding: 4px 0; border-top: 1px dashed var(--border); }
+.auq-preview-q:first-child { border-top: 0; padding-top: 0; }
+.auq-opt-list {
+  list-style: none; margin: 6px 0 0; padding: 0;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.auq-opt-list li {
+  display: flex; align-items: baseline; gap: 8px;
+  padding: 3px 8px; border-radius: 4px;
+  background: var(--panel-2);
+}
+.auq-opt-label {
+  font-size: 12px; color: var(--text);
+}
+.auq-opt-desc {
+  font-size: 11px; line-height: 1.45;
+}
+.auq-plan {
+  white-space: pre-wrap; line-height: 1.55; font-size: 12px;
+  background: var(--panel); border-radius: 6px; padding: 10px 12px;
+}
+
 .msg { display: flex; gap: 12px; }
 .msg .avatar {
   width: 28px; height: 28px; border-radius: 50%;
@@ -267,6 +297,7 @@ button { cursor: pointer; }
 .prompt-toolbar {
   display: flex; align-items: center; gap: 8px;
 }
+.prompt-toolbar-spacer { flex: 1; }
 .prompt-toolbar select {
   background: var(--panel-2); color: var(--text);
   border: 1px solid var(--border); border-radius: 6px;
