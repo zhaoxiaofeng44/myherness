@@ -131,6 +131,7 @@ function serialize(session) {
     name: session.name,
     workdir: session.workdir,
     policyId: session.policyId,
+    parentSessionId: session.parentSessionId || null,
     createdAt: session.createdAt,
     endedAt: session.endedAt,
     status: session.status,

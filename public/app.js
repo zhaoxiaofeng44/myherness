@@ -37,6 +37,8 @@ const state = {
   depositSelected: null,  // { habits: Set<idx>, experiences: Set<idx> }
   suggestRelevant: [],    // experiences relevant to current prompt input
   suggestDebounce: null,
+  expandedHeads: new Set(), // chain heads whose history list is expanded
+  pendingPromptDraft: null, // { sessionId, text } — applied once active session matches
 };
 
 // ===== Utility =====
@@ -63,6 +65,105 @@ function truncate(s, n = 200) {
   return s.length > n ? s.slice(0, n) + '…' : s;
 }
 
+// ===== Slash commands (autocomplete) =====
+const SLASH_COMMANDS = [
+  { cmd: '/compact', desc: '压缩上下文 — 总结对话关键信息，释放上下文窗口' },
+  { cmd: '/review', desc: '代码审查 — 对当前分支变更进行正确性、安全性、性能审查' },
+  { cmd: '/commit', desc: '智能提交 — 分析变更并生成规范的 commit message' },
+  { cmd: '/test', desc: '运行测试 — 执行测试套件，分析失败原因' },
+  { cmd: '/explain', desc: '解释代码 — 解释指定文件或模块的实现逻辑', args: '<文件或模块>' },
+  { cmd: '/fix', desc: '修复问题 — 定位根本原因并实施修复', args: '<问题描述>' },
+  { cmd: '/refactor', desc: '重构代码 — 保持行为不变，改善结构与可读性', args: '<目标>' },
+  { cmd: '/pr', desc: '创建 PR — 基于当前分支变更创建 Pull Request' },
+  { cmd: '/status', desc: '项目状态 — Git 状态、最近 commit、运行中的服务' },
+];
+
+const slashState = { active: false, selectedIdx: 0, filtered: [] };
+
+function updateSlashMenu() {
+  const input = $('#promptInput');
+  const menu = $('#slashMenu');
+  const val = input.value;
+
+  const firstLine = val.split('\n')[0];
+  if (!firstLine.startsWith('/') || firstLine.includes(' ') || val.indexOf('\n') > 0) {
+    hideSlashMenu();
+    return;
+  }
+
+  const query = firstLine.toLowerCase();
+  slashState.filtered = SLASH_COMMANDS.filter(
+    (c) => c.cmd.startsWith(query) || c.desc.includes(query.slice(1)),
+  );
+
+  if (slashState.filtered.length === 0) {
+    hideSlashMenu();
+    return;
+  }
+
+  slashState.active = true;
+  slashState.selectedIdx = Math.min(slashState.selectedIdx, slashState.filtered.length - 1);
+  menu.classList.remove('hidden');
+  menu.innerHTML = slashState.filtered
+    .map((c, i) => `
+      <div class="slash-menu-item ${i === slashState.selectedIdx ? 'active' : ''}" data-i="${i}">
+        <span class="slash-cmd">${escapeHtml(c.cmd)}${c.args ? ' ' + escapeHtml(c.args) : ''}</span>
+        <span class="slash-desc">${escapeHtml(c.desc)}</span>
+      </div>`)
+    .join('');
+
+  $$('.slash-menu-item', menu).forEach((el) => {
+    el.addEventListener('mouseenter', () => {
+      slashState.selectedIdx = parseInt(el.dataset.i);
+      renderSlashSelection();
+    });
+    el.addEventListener('click', () => applySlashCommand(parseInt(el.dataset.i)));
+  });
+}
+
+function renderSlashSelection() {
+  const menu = $('#slashMenu');
+  $$('.slash-menu-item', menu).forEach((el, i) =>
+    el.classList.toggle('active', i === slashState.selectedIdx),
+  );
+}
+
+function applySlashCommand(idx) {
+  const item = slashState.filtered[idx];
+  if (!item) return;
+  const input = $('#promptInput');
+  input.value = item.cmd + (item.args ? ' ' : '');
+  input.focus();
+  hideSlashMenu();
+  const len = input.value.length;
+  input.setSelectionRange(len, len);
+}
+
+function hideSlashMenu() {
+  slashState.active = false;
+  slashState.selectedIdx = 0;
+  $('#slashMenu').classList.add('hidden');
+}
+
+function handleSlashKeydown(e) {
+  if (!slashState.active) return;
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    slashState.selectedIdx = (slashState.selectedIdx + 1) % slashState.filtered.length;
+    renderSlashSelection();
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    slashState.selectedIdx = (slashState.selectedIdx - 1 + slashState.filtered.length) % slashState.filtered.length;
+    renderSlashSelection();
+  } else if (e.key === 'Tab' || (e.key === 'Enter' && !e.metaKey && !e.ctrlKey)) {
+    e.preventDefault();
+    applySlashCommand(slashState.selectedIdx);
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    hideSlashMenu();
+  }
+}
+
 async function api(path, opts = {}) {
   const res = await fetch(path, {
     headers: { 'Content-Type': 'application/json' },
@@ -82,6 +183,10 @@ async function init() {
   $('#newSessionForm').addEventListener('submit', submitNewSession);
   $('#promptForm').addEventListener('submit', submitPrompt);
   $('#promptInput').addEventListener('keydown', (e) => {
+    if (slashState.active) {
+      handleSlashKeydown(e);
+      if (e.defaultPrevented) return;
+    }
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
       e.preventDefault();
       $('#promptForm').requestSubmit();
@@ -118,7 +223,10 @@ async function init() {
   $('#depositCancel').addEventListener('click', () => $('#depositDialog').close());
   $('#depositCommit').addEventListener('click', commitDepositSelection);
 
-  $('#promptInput').addEventListener('input', scheduleSuggestRelevant);
+  $('#promptInput').addEventListener('input', () => {
+    updateSlashMenu();
+    scheduleSuggestRelevant();
+  });
 
   // Load metadata
   const cwdResp = await api('/api/cwd');
@@ -212,22 +320,95 @@ function renderSessionList() {
     ul.innerHTML = '<li class="muted" style="padding:6px 10px;font-size:12px">还没有会话</li>';
     return;
   }
-  ul.innerHTML = state.sessions
-    .map((s) => {
-      const cls = s.id === state.activeSessionId ? 'session-item active' : 'session-item';
-      const status = renderStatusBadge(s.status);
-      return `
-        <li class="${cls}" data-id="${s.id}">
-          <div class="si-name">
-            <span>${escapeHtml(s.name)}</span>${status}
-          </div>
-          <div class="si-meta">${escapeHtml(s.workdir)}</div>
-        </li>`;
-    })
-    .join('');
+
+  // A "head" is a session that no other session points to via parentSessionId.
+  // History walks parentSessionId backwards from the head until null/missing.
+  const sessionMap = new Map(state.sessions.map((s) => [s.id, s]));
+  const isParentOf = new Set();
+  for (const s of state.sessions) {
+    if (s.parentSessionId && sessionMap.has(s.parentSessionId)) {
+      isParentOf.add(s.parentSessionId);
+    }
+  }
+  const heads = state.sessions
+    .filter((s) => !isParentOf.has(s.id))
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+  function buildHistory(headId) {
+    const out = [];
+    let cur = sessionMap.get(headId);
+    const seen = new Set([headId]);
+    while (cur && cur.parentSessionId && !seen.has(cur.parentSessionId)) {
+      const p = sessionMap.get(cur.parentSessionId);
+      if (!p) break;
+      out.push(p);
+      seen.add(p.id);
+      cur = p;
+    }
+    return out;
+  }
+
+  const blocks = [];
+  for (const head of heads) {
+    const history = buildHistory(head.id);
+    const expanded = state.expandedHeads.has(head.id);
+    blocks.push(renderSessionItem(head, {
+      isHead: true,
+      historyCount: history.length,
+      expanded,
+    }));
+    if (history.length > 0) {
+      const hidden = expanded ? '' : ' hidden';
+      for (const h of history) {
+        blocks.push(renderSessionItem(h, {
+          isHead: false,
+          headId: head.id,
+          hidden,
+        }));
+      }
+    }
+  }
+  ul.innerHTML = blocks.join('');
+
   $$('.session-item').forEach((el) => {
-    el.addEventListener('click', () => selectSession(el.dataset.id));
+    el.addEventListener('click', (ev) => {
+      if (ev.target.closest('.si-toggle')) return;
+      selectSession(el.dataset.id);
+    });
   });
+  $$('.si-toggle').forEach((btn) => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const headId = btn.dataset.head;
+      if (state.expandedHeads.has(headId)) state.expandedHeads.delete(headId);
+      else state.expandedHeads.add(headId);
+      renderSessionList();
+    });
+  });
+}
+
+function renderSessionItem(s, opts) {
+  const { isHead, historyCount = 0, expanded = false, headId, hidden = '' } = opts;
+  const classes = ['session-item'];
+  if (s.id === state.activeSessionId) classes.push('active');
+  if (!isHead) classes.push('history');
+  const status = renderStatusBadge(s.status);
+  const toggle =
+    isHead && historyCount > 0
+      ? `<button class="si-toggle" data-head="${s.id}" title="${expanded ? '收起' : '展开'}历史">
+          <span class="si-toggle-caret">${expanded ? '▾' : '▸'}</span>
+          <span class="si-toggle-count">${historyCount}</span>
+        </button>`
+      : '';
+  const headAttr = !isHead && headId ? ` data-history-of="${headId}"` : '';
+  return `
+    <li class="${classes.join(' ')}${hidden}" data-id="${s.id}"${headAttr}>
+      <div class="si-name">
+        ${toggle}
+        <span class="si-name-text">${escapeHtml(s.name)}</span>${status}
+      </div>
+      <div class="si-meta">${escapeHtml(s.workdir)}</div>
+    </li>`;
 }
 
 function renderStatusBadge(status) {
@@ -872,25 +1053,107 @@ async function cancelTurn() {
 }
 // Spin up a fresh session reusing the current session's workdir + policy.
 // Useful when one task wraps up and the user wants a clean conversation
-// context (no --resume) for the next task — skips the dialog.
+// context (no --resume) for the next task — skips the dialog. Also extracts
+// background / progress / next-step hints from the current session and
+// pre-fills the new prompt input so the user only has to edit & send.
 async function startNextTask() {
   if (!state.detail) return;
   const cur = state.detail.session;
   const baseName = (cur.name || '').replace(/\s*#\d+$/, '');
   const nextNum = state.sessions.filter((s) => (s.name || '').startsWith(baseName)).length + 1;
+
+  const draft = buildNextTaskDraft(state.detail);
   const body = {
     name: `${baseName} #${nextNum}`,
     workdir: cur.workdir,
     policyId: cur.policyId,
+    parentSessionId: cur.id,
   };
   try {
     const resp = await api('/api/sessions', { method: 'POST', body: JSON.stringify(body) });
+    state.pendingPromptDraft = { sessionId: resp.session.id, text: draft };
     await refreshSessions();
     selectSession(resp.session.id);
+    applyPendingPromptDraft();
     $('#promptInput').focus();
   } catch (err) {
     alert('开启下一任务失败：' + err.message);
   }
+}
+
+function applyPendingPromptDraft() {
+  const p = state.pendingPromptDraft;
+  if (!p || p.sessionId !== state.activeSessionId) return;
+  const ta = $('#promptInput');
+  if (!ta) return;
+  ta.value = p.text;
+  const idx = p.text.indexOf(NEXT_TASK_PLACEHOLDER);
+  if (idx >= 0) {
+    const pos = idx + NEXT_TASK_PLACEHOLDER.length;
+    try {
+      ta.setSelectionRange(pos, pos);
+    } catch {}
+  }
+  state.pendingPromptDraft = null;
+}
+
+const NEXT_TASK_PLACEHOLDER = '（在此填写下一步要交给 Claude 的具体任务……）';
+
+// Build a "handoff" draft prompt that the user can edit before sending.
+// Pulls: original prompt (background), latest assistant text (progress),
+// and the changed-files list. The next-step section is left as a placeholder
+// since Claude's last message rarely encodes a clean "do X next".
+function buildNextTaskDraft(detail) {
+  const turns = Array.isArray(detail.turns) ? detail.turns : [];
+  const events = Array.isArray(detail.events) ? detail.events : [];
+  const changes = Array.isArray(detail.changes) ? detail.changes : [];
+
+  const firstPrompt =
+    turns.length > 0 && turns[0].prompt ? String(turns[0].prompt).trim() : '';
+  const turnCount = turns.length;
+
+  let lastAssistantText = '';
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.type === 'assistant:text' && e.text && e.text.trim()) {
+      lastAssistantText = e.text.trim();
+      break;
+    }
+  }
+
+  const fileMap = new Map();
+  for (const cs of changes) {
+    for (const f of cs.files || []) {
+      if (f.relPath) fileMap.set(f.relPath, f.kind);
+    }
+  }
+  const fileList = Array.from(fileMap.entries());
+  const fileLines = fileList
+    .slice(0, 12)
+    .map(([rel, kind]) => `- [${kind}] ${rel}`)
+    .join('\n');
+  const fileMore = fileList.length > 12 ? `\n- …其余 ${fileList.length - 12} 个文件略` : '';
+
+  const bg = firstPrompt ? truncate(firstPrompt, 400) : '（上一任务无初始提示）';
+  const progressParts = [];
+  progressParts.push(`- 共 ${turnCount} 轮，${fileList.length} 个变更文件`);
+  if (fileList.length > 0) progressParts.push(`- 改动文件：\n${fileLines}${fileMore}`);
+  if (lastAssistantText) {
+    progressParts.push(`- Claude 最终回复：\n${truncate(lastAssistantText, 600)}`);
+  }
+  const progress = progressParts.join('\n');
+
+  return [
+    `# 背景（上一任务）`,
+    bg,
+    ``,
+    `# 已完成进展`,
+    progress,
+    ``,
+    `# 下一步任务`,
+    NEXT_TASK_PLACEHOLDER,
+    ``,
+  ].join('\n');
 }
 async function changePolicy() {
   if (!state.activeSessionId) return;

@@ -40,21 +40,26 @@ export class SessionManager extends EventEmitter {
     return this.sessions.get(id);
   }
 
-  create({ workdir, name, policyId }) {
+  create({ workdir, name, policyId, parentSessionId }) {
     let abs = path.resolve(workdir || process.cwd());
-    if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) {
-      throw new Error(`工作目录不存在: ${abs}`);
+    if (!fs.existsSync(abs)) {
+      fs.mkdirSync(abs, { recursive: true });
+    } else if (!fs.statSync(abs).isDirectory()) {
+      throw new Error(`路径已存在但不是目录: ${abs}`);
     }
     // Resolve symlinks (e.g. /tmp -> /private/tmp on macOS) so paths the
     // CLI reports later match the workdir we record.
     try {
       abs = fs.realpathSync(abs);
     } catch {}
+    const parentId =
+      parentSessionId && this.sessions.has(parentSessionId) ? parentSessionId : null;
     const session = new Session({
       id: nextId(),
       workdir: abs,
       name: name || path.basename(abs),
       policyId: policyId || 'balanced',
+      parentSessionId: parentId,
       bus: this,
     });
     session._store = this.store;
@@ -86,6 +91,7 @@ export class SessionManager extends EventEmitter {
       workdir: persisted.workdir,
       name: persisted.name,
       policyId: persisted.policyId,
+      parentSessionId: persisted.parentSessionId || null,
       bus: this,
     });
     session._store = this.store;
@@ -143,11 +149,12 @@ export class SessionManager extends EventEmitter {
 }
 
 class Session {
-  constructor({ id, workdir, name, policyId, bus }) {
+  constructor({ id, workdir, name, policyId, parentSessionId, bus }) {
     this.id = id;
     this.workdir = workdir;
     this.name = name;
     this.policyId = policyId;
+    this.parentSessionId = parentSessionId || null;
     this.bus = bus;
 
     this.createdAt = Date.now();
@@ -176,6 +183,7 @@ class Session {
       name: this.name,
       workdir: this.workdir,
       policyId: this.policyId,
+      parentSessionId: this.parentSessionId || null,
       status: this.status,
       createdAt: this.createdAt,
       endedAt: this.endedAt,

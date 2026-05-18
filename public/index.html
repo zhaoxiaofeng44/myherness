@@ -57,7 +57,10 @@
                 title="复用当前工作目录与策略，开启下一个任务（新建会话）" disabled>＋ 下一任务</button>
             </div>
             <div class="prompt-input-row">
-              <textarea id="promptInput" placeholder="向 Claude Code 发送指令…（Cmd/Ctrl + Enter 发送）" rows="3"></textarea>
+              <div class="prompt-input-wrap">
+                <textarea id="promptInput" placeholder="向 Claude Code 发送指令…（Cmd/Ctrl + Enter 发送）" rows="3"></textarea>
+                <div id="slashMenu" class="slash-menu hidden"></div>
+              </div>
               <button type="submit" class="primary-btn">发送</button>
             </div>
           </form>

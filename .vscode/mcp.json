@@ -1,0 +1,20 @@
+{
+	"servers": {
+		"preplan2": {
+			"type": "stdio",
+			"command": "npx",
+			"args": [
+				"mcp-remote",
+				"https://mcp.alibaba-inc.com/preplan2/mcp"
+			]
+		},
+		"orange": {
+			"type": "http",
+			"url": "https://tmcp.alibaba-inc.com/mcp/orange/mcp",
+			"headers": {
+				"Authorization": "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJUTUNQIiwic3ViIjoiQlVDX1VTRVI6MjI0OTE1IiwiaWF0IjoxNzY0MzIxMTAzLCJqdGkiOiJjMDUzYmJhNy02NmNmLTRiMGMtOWExYS1kNTgxODFmZDcwYjgifQ.5J0Iw0WsQgM5ieQIQ8F6gz4OVfQCXkmatU1wC-QWXIQ"
+			}
+		}
+	},
+	"inputs": []
+}
