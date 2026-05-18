@@ -523,14 +523,16 @@ function handleSessionEvent(evt) {
     }
   }
   if (evt.type === 'approval:pending') {
-    state.detail.pendingApprovals.push({
-      id: evt.toolUseId,
-      tool: evt.tool,
-      input: evt.input,
-      reason: evt.reason,
-      memoryHint: evt.memoryHint || null,
-      deciderState: null,
-    });
+    if (!state.detail.pendingApprovals.some((a) => a.id === evt.toolUseId)) {
+      state.detail.pendingApprovals.push({
+        id: evt.toolUseId,
+        tool: evt.tool,
+        input: evt.input,
+        reason: evt.reason,
+        memoryHint: evt.memoryHint || null,
+        deciderState: null,
+      });
+    }
   }
   if (evt.type === 'approval:resolved') {
     state.detail.pendingApprovals = state.detail.pendingApprovals.filter(
