@@ -6,13 +6,13 @@ import { redactString } from './memoryEngine.js';
 
 const MAX_TURN_LOG_BYTES = 12_000;
 
-export async function distillExperiences({ session, turnId, signal, timeoutMs = 60_000 } = {}) {
+export async function distillExperiences({ session, turnId, guidance = '', signal, timeoutMs = 60_000 } = {}) {
   if (!session || !turnId) return { items: [], error: 'missing session/turnId' };
   const turn = session.turns?.find((t) => t.id === turnId);
   if (!turn) return { items: [], error: `turn ${turnId} not found` };
 
   const transcript = buildTranscript({ session, turnId });
-  const prompt = buildPrompt({ session, turn, transcript });
+  const prompt = buildPrompt({ session, turn, transcript, guidance });
 
   let result;
   try {
@@ -49,7 +49,10 @@ export async function distillExperiences({ session, turnId, signal, timeoutMs = 
   return { items, error: null, usage: result.usage, cost: result.cost };
 }
 
-function buildPrompt({ session, turn, transcript }) {
+function buildPrompt({ session, turn, transcript, guidance = '' }) {
+  const guidanceBlock = guidance && guidance.trim()
+    ? ['【用户指引】 优先围绕以下方向提炼经验，与之无关的可以省略：', redactString(guidance.trim()), '']
+    : [];
   return [
     '你是经验提炼助手。下面是用户与 Claude Code 的一次任务会话日志（已脱敏）。',
     '请从中提炼可在未来复用的"经验记忆"。',
@@ -69,6 +72,7 @@ function buildPrompt({ session, turn, transcript }) {
     '  ...',
     '] }',
     '',
+    ...guidanceBlock,
     `【工程】 workdir=${session.workdir}  policy=${session.policyId}`,
     `【本轮提示】 ${redactString(String(turn.prompt || '').slice(0, 1000))}`,
     '【会话日志】',

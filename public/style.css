@@ -113,6 +113,15 @@ button { cursor: pointer; }
 }
 .session-list .si-toggle:hover { color: var(--accent); border-color: var(--accent); }
 .session-list .si-toggle-caret { font-size: 9px; }
+.session-list .si-delete {
+  margin-left: auto; flex-shrink: 0;
+  background: transparent; color: var(--muted);
+  border: 0; padding: 0 4px; line-height: 1;
+  font-size: 16px; border-radius: 4px;
+  opacity: 0; transition: opacity 0.12s, color 0.12s, background 0.12s;
+}
+.session-list .session-item:hover .si-delete { opacity: 0.7; }
+.session-list .si-delete:hover { opacity: 1; color: var(--red); background: rgba(226, 91, 107, 0.12); }
 .session-list .session-item.history {
   margin-left: 14px; padding: 6px 10px;
   border-left: 1px dashed var(--border);
@@ -842,7 +851,13 @@ button { cursor: pointer; }
   display: flex; flex-direction: column; gap: 6px;
 }
 .suggest-panel:empty { display: none; }
-.suggest-head { font-size: 11px; }
+.suggest-head {
+  font-size: 11px; background: none; border: none;
+  color: inherit; padding: 0; text-align: left;
+  cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+}
+.suggest-head:hover { color: var(--text); }
+.suggest-chevron { display: inline-block; width: 10px; }
 .suggest-card {
   padding: 6px 8px; background: var(--panel);
   border: 1px solid var(--border); border-radius: 4px;
@@ -857,4 +872,58 @@ button { cursor: pointer; }
   background: var(--panel-2);
   border: 1px dashed var(--border); border-radius: 6px;
   position: sticky; bottom: 0;
+}
+
+.deposit-guidance {
+  display: flex; gap: 8px; align-items: flex-start;
+  margin-bottom: 12px;
+}
+.deposit-guidance textarea {
+  flex: 1; resize: vertical;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 8px; font-size: 12px; line-height: 1.5;
+  font-family: inherit;
+}
+
+/* Terminal panel — xterm.js attached to a per-session PTY */
+.terminal-panel {
+  margin-top: 10px;
+  display: flex; flex-direction: column;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: #0b0e14; color: #d1d5db;
+  overflow: hidden;
+}
+.terminal-head {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; background: #11151c;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.terminal-label { color: #6b7280; font-size: 11px; letter-spacing: 0.5px; }
+.terminal-cwd {
+  flex: 1; color: #93c5fd;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.terminal-head .ghost-btn { font-size: 11px; padding: 3px 8px; }
+.terminal-screen { height: 80px; padding: 4px 6px; }
+.terminal-screen .xterm,
+.terminal-screen .xterm-viewport,
+.terminal-screen .xterm-screen { height: 100% !important; }
+.terminal-screen .xterm-viewport { background-color: transparent !important; }
+
+/* Fullscreen — terminal panel takes over the right area (everything inside
+   .main), leaving the sidebar untouched. Sidebar is 280px wide per #app's
+   grid-template-columns, so we anchor at left:280px. */
+.terminal-panel.fullscreen {
+  position: fixed;
+  left: 280px; top: 0; right: 0; bottom: 0;
+  margin: 0;
+  border: 0; border-radius: 0;
+  z-index: 50;
+  display: flex; flex-direction: column;
+}
+.terminal-panel.fullscreen .terminal-screen {
+  flex: 1; height: auto; min-height: 0;
 }

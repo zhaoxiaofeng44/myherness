@@ -5,6 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Claude Code Console</title>
     <link rel="stylesheet" href="/style.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
   </head>
   <body>
     <div id="app">
@@ -52,6 +55,8 @@
               <span id="statusPill" class="status-pill"></span>
               <select id="policySelect" title="切换会话策略（运行模式）"></select>
               <button id="cancelBtn" type="button" class="ghost-btn" disabled>停止</button>
+              <button id="depositToolbarBtn" type="button" class="ghost-btn" hidden
+                title="把本轮的工具决策与经验沉淀到记忆">沉淀本轮经验</button>
               <span class="prompt-toolbar-spacer"></span>
               <button id="newTaskBtn" type="button" class="ghost-btn"
                 title="复用当前工作目录与策略，开启下一个任务（新建会话）" disabled>＋ 下一任务</button>
@@ -62,6 +67,17 @@
                 <div id="slashMenu" class="slash-menu hidden"></div>
               </div>
               <button type="submit" class="primary-btn">发送</button>
+            </div>
+            <div id="terminalPanel" class="terminal-panel">
+              <div class="terminal-head">
+                <span class="terminal-label">终端</span>
+                <span class="terminal-cwd" id="terminalCwd"></span>
+                <button type="button" id="terminalRestartBtn" class="ghost-btn"
+                  title="结束当前 shell 并重启一个新的">重启 shell</button>
+                <button type="button" id="terminalFullscreenBtn" class="ghost-btn"
+                  title="切换全屏（占据右侧整页，便于查看历史）">⛶ 全屏</button>
+              </div>
+              <div id="terminalScreen" class="terminal-screen"></div>
             </div>
           </form>
         </section>
@@ -132,6 +148,11 @@
     <dialog id="depositDialog" class="dialog deposit-dialog">
       <div id="depositDialogBody">
         <h3>沉淀本轮经验</h3>
+        <div class="deposit-guidance">
+          <textarea id="depositGuidance" rows="2"
+            placeholder="（可选）指引希望沉淀哪些方向的经验，例如：只关注调试技巧 / 强调命名规范…"></textarea>
+          <button type="button" id="depositRedistill" class="ghost-btn" disabled>重新蒸馏</button>
+        </div>
         <div id="depositDialogContent" class="muted">正在提取候选记忆…</div>
         <div class="dialog-actions">
           <button type="button" id="depositCancel" class="ghost-btn">取消</button>

@@ -35,7 +35,10 @@ const state = {
   memoryFilterScope: 'all', // 'all' | 'workdir'
   depositDraft: null,     // { habits, experiences, distillError, turnId }
   depositSelected: null,  // { habits: Set<idx>, experiences: Set<idx> }
+  lastDepositTurnId: null, // most recently finished turn — used by toolbar button
+  terminal: null, // { term, fit, attachedSessionId, resizeObserver }
   suggestRelevant: [],    // experiences relevant to current prompt input
+  suggestExpanded: false, // 相关经验默认折叠，点击标题展开
   suggestDebounce: null,
   expandedHeads: new Set(), // chain heads whose history list is expanded
   pendingPromptDraft: null, // { sessionId, text } — applied once active session matches
@@ -222,6 +225,16 @@ async function init() {
 
   $('#depositCancel').addEventListener('click', () => $('#depositDialog').close());
   $('#depositCommit').addEventListener('click', commitDepositSelection);
+  $('#depositRedistill').addEventListener('click', () => {
+    const turnId = state.depositDraft?.turnId || state.lastDepositTurnId;
+    if (turnId) openDepositDialog(turnId, { keepOpen: true });
+  });
+  $('#depositToolbarBtn').addEventListener('click', () => {
+    if (state.lastDepositTurnId) openDepositDialog(state.lastDepositTurnId);
+  });
+
+  $('#terminalRestartBtn').addEventListener('click', restartTerminal);
+  $('#terminalFullscreenBtn').addEventListener('click', toggleTerminalFullscreen);
 
   $('#promptInput').addEventListener('input', () => {
     updateSlashMenu();
@@ -290,6 +303,16 @@ function connectEvents() {
   es.addEventListener('memory:updated', () => {
     if (state.view === 'memory') loadMemory();
   });
+  es.addEventListener('term:data', (e) => {
+    const data = JSON.parse(e.data);
+    if (data.sessionId !== state.activeSessionId) return;
+    if (state.terminal?.term) state.terminal.term.write(data.data);
+  });
+  es.addEventListener('term:exit', (e) => {
+    const data = JSON.parse(e.data);
+    if (data.sessionId !== state.activeSessionId) return;
+    if (state.terminal) state.terminal.attachedSessionId = null;
+  });
   es.addEventListener('gitnexus:done', (e) => {
     const data = JSON.parse(e.data);
     if (data.sessionId !== state.activeSessionId) return;
@@ -312,6 +335,28 @@ async function refreshSessions() {
   if (!state.activeSessionId && state.sessions.length > 0) {
     selectSession(state.sessions[0].id);
   }
+}
+
+async function deleteSession(id) {
+  const target = state.sessions.find((s) => s.id === id);
+  const label = target ? `${target.name}（${target.id}）` : id;
+  if (!confirm(`确定删除会话 ${label} 吗？\n\n该会话的运行进程会被终止，事件 / 终端 / 持久化记录都会清除（不可撤销）。`)) {
+    return;
+  }
+  try {
+    await api(`/api/sessions/${id}`, { method: 'DELETE' });
+  } catch (e) {
+    alert('删除失败：' + e.message);
+    return;
+  }
+  if (state.activeSessionId === id) {
+    state.activeSessionId = null;
+    state.detail = null;
+  }
+  // SSE `session:removed` will refresh the list; do an immediate refresh too
+  // in case the event hasn't arrived yet (avoids a flicker showing the deleted row).
+  await refreshSessions();
+  renderAll();
 }
 
 function renderSessionList() {
@@ -373,6 +418,7 @@ function renderSessionList() {
   $$('.session-item').forEach((el) => {
     el.addEventListener('click', (ev) => {
       if (ev.target.closest('.si-toggle')) return;
+      if (ev.target.closest('.si-delete')) return;
       selectSession(el.dataset.id);
     });
   });
@@ -383,6 +429,12 @@ function renderSessionList() {
       if (state.expandedHeads.has(headId)) state.expandedHeads.delete(headId);
       else state.expandedHeads.add(headId);
       renderSessionList();
+    });
+  });
+  $$('.si-delete').forEach((btn) => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      deleteSession(btn.dataset.del);
     });
   });
 }
@@ -406,6 +458,7 @@ function renderSessionItem(s, opts) {
       <div class="si-name">
         ${toggle}
         <span class="si-name-text">${escapeHtml(s.name)}</span>${status}
+        <button class="si-delete" data-del="${s.id}" title="删除会话">×</button>
       </div>
       <div class="si-meta">${escapeHtml(s.workdir)}</div>
     </li>`;
@@ -575,6 +628,7 @@ function switchView(name) {
 function renderAll() {
   renderTopbar();
   renderViewIfActive();
+  renderTerminal();
 }
 
 function renderViewIfActive() {
@@ -877,8 +931,9 @@ function wireApprovalCards() {
     });
   });
 
-  // AskUserQuestion: submit aggregates per-question answers, prefills the
-  // prompt textarea so the user can review/edit, then resolves the approval.
+  // AskUserQuestion: submit aggregates per-question answers and resolves the
+  // approval. The backend resumes Claude with the answer immediately, so we
+  // do NOT also paste it into the prompt textarea (would imply a second send).
   $$('.auq-submit', $('#approvalPane')).forEach((btn) => {
     btn.addEventListener('click', () => submitAskUserQuestion(btn.dataset.id));
   });
@@ -921,12 +976,6 @@ function submitAskUserQuestion(id) {
   if (noteText) lines.push(`备注：${noteText}`);
   const answer = lines.join('\n');
 
-  const promptInput = $('#promptInput');
-  if (answer) {
-    const existing = promptInput.value.trim();
-    promptInput.value = existing ? `${existing}\n\n${answer}` : answer;
-    promptInput.focus();
-  }
   resolveApproval(id, 'approve', answer, auqAnswers);
 }
 
@@ -2614,17 +2663,23 @@ function openMemoryEditDialog(id) {
 
 // ----- Deposit / review modal -----
 
-async function openDepositDialog(turnId) {
+async function openDepositDialog(turnId, { keepOpen = false } = {}) {
   if (!state.activeSessionId) return;
   state.depositDraft = null;
   state.depositSelected = null;
-  $('#depositDialog').showModal();
+  const dialog = $('#depositDialog');
+  if (!keepOpen) {
+    $('#depositGuidance').value = '';
+    if (!dialog.open) dialog.showModal();
+  }
+  const guidance = $('#depositGuidance').value.trim();
   $('#depositDialogContent').innerHTML = '<div class="muted">正在提取候选记忆 + 蒸馏经验（最多 60 秒）…</div>';
   $('#depositCommit').disabled = true;
+  $('#depositRedistill').disabled = true;
   try {
     const resp = await api(`/api/sessions/${state.activeSessionId}/turns/${turnId}/distill`, {
       method: 'POST',
-      body: JSON.stringify({ scope: 'workdir', includeExperiences: true }),
+      body: JSON.stringify({ scope: 'workdir', includeExperiences: true, guidance }),
     });
     state.depositDraft = { ...resp, turnId };
     state.depositSelected = {
@@ -2634,6 +2689,8 @@ async function openDepositDialog(turnId) {
     renderDepositDialog();
   } catch (e) {
     $('#depositDialogContent').innerHTML = `<div class="empty">提取失败：${escapeHtml(e.message)}</div>`;
+  } finally {
+    $('#depositRedistill').disabled = false;
   }
 }
 
@@ -2769,36 +2826,178 @@ function renderSuggestPanel() {
     panel.innerHTML = '';
     return;
   }
+  const n = state.suggestRelevant.length;
+  const expanded = state.suggestExpanded;
+  const cards = expanded
+    ? state.suggestRelevant.map((e) => `
+        <div class="suggest-card">
+          <strong>${escapeHtml(e.title)}</strong>
+          <div class="muted">${escapeHtml(truncate(e.body, 200))}</div>
+        </div>`).join('')
+    : '';
   panel.innerHTML = `
-    <div class="suggest-head muted">📚 相关经验（发送时会注入到提示）</div>
-    ${state.suggestRelevant.map((e) => `
-      <div class="suggest-card">
-        <strong>${escapeHtml(e.title)}</strong>
-        <div class="muted">${escapeHtml(truncate(e.body, 200))}</div>
-      </div>`).join('')}`;
+    <button type="button" class="suggest-head muted" id="suggestToggle"
+      aria-expanded="${expanded}">
+      <span class="suggest-chevron">${expanded ? '▾' : '▸'}</span>
+      📚 相关经验 ${n} 条（发送时会注入到提示）
+    </button>
+    ${cards}`;
+  const toggle = $('#suggestToggle');
+  if (toggle) toggle.addEventListener('click', () => {
+    state.suggestExpanded = !state.suggestExpanded;
+    renderSuggestPanel();
+  });
 }
 
 function insertDepositButtons() {
-  if (!state.detail) return;
-  const finishedTurns = state.detail.turns.filter((t) => t.status === 'done');
-  if (finishedTurns.length === 0) return;
+  const btn = $('#depositToolbarBtn');
+  if (!btn) return;
   const pane = $('#chatPane');
-  if (!pane) return;
-  // Append a small bar after each turn-divider marking the END of that turn.
-  // We instead add a single floating "沉淀经验" toolbar below the chat for the
-  // most recent completed turn — simpler and works well for the common flow.
-  let toolbar = pane.querySelector('.chat-deposit-bar');
-  if (!toolbar) {
-    toolbar = document.createElement('div');
-    toolbar.className = 'chat-deposit-bar';
-    pane.appendChild(toolbar);
+  const legacy = pane?.querySelector('.chat-deposit-bar');
+  if (legacy) legacy.remove();
+  if (!state.detail) {
+    btn.hidden = true;
+    state.lastDepositTurnId = null;
+    return;
+  }
+  const finishedTurns = state.detail.turns.filter((t) => t.status === 'done');
+  if (finishedTurns.length === 0) {
+    btn.hidden = true;
+    state.lastDepositTurnId = null;
+    return;
   }
   const last = finishedTurns[finishedTurns.length - 1];
-  toolbar.innerHTML = `
-    <span class="muted">最近完成的轮：${escapeHtml(last.id)}</span>
-    <button class="primary-btn deposit-btn" data-turn="${escapeHtml(last.id)}">沉淀本轮经验 →</button>`;
-  const btn = toolbar.querySelector('.deposit-btn');
-  if (btn) btn.addEventListener('click', () => openDepositDialog(btn.dataset.turn));
+  state.lastDepositTurnId = last.id;
+  btn.hidden = false;
+  btn.title = `沉淀第 ${last.id} 轮的工具决策与经验`;
+}
+
+// ===== Terminal (xterm.js + backend PTY via SSE) =====
+
+// One xterm instance is reused across sessions; we just reattach to whichever
+// session is active. Output flows in over SSE (`term:data`); keystrokes go
+// out as POST /term/input. The backend keeps a small replay buffer so the
+// screen is rehydrated on page refresh / session switch.
+
+function ensureTerminal() {
+  if (state.terminal?.term) return state.terminal;
+  if (typeof Terminal === 'undefined') return null;
+  const screen = $('#terminalScreen');
+  if (!screen) return null;
+  const term = new Terminal({
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+    fontSize: 12,
+    cursorBlink: true,
+    convertEol: true,
+    theme: { background: '#0b0e14', foreground: '#d1d5db', cursor: '#93c5fd' },
+  });
+  const FitAddonCtor = window.FitAddon?.FitAddon;
+  const fit = FitAddonCtor ? new FitAddonCtor() : null;
+  if (fit) term.loadAddon(fit);
+  term.open(screen);
+  term.onData((data) => sendTerminalInput(data));
+  term.onResize(({ cols, rows }) => sendTerminalResize(cols, rows));
+  const ro = new ResizeObserver(() => {
+    try { fit?.fit(); } catch {}
+  });
+  ro.observe(screen);
+  state.terminal = { term, fit, attachedSessionId: null, resizeObserver: ro };
+  return state.terminal;
+}
+
+async function attachTerminalToActiveSession() {
+  const t = ensureTerminal();
+  if (!t) return;
+  const sessionId = state.activeSessionId;
+  if (!sessionId) {
+    t.term.reset();
+    t.term.write('\x1b[90m请先选择一个会话\x1b[0m\r\n');
+    t.attachedSessionId = null;
+    return;
+  }
+  if (t.attachedSessionId === sessionId) return;
+  try { t.fit?.fit(); } catch {}
+  t.term.reset();
+  const cols = t.term.cols || 80;
+  const rows = t.term.rows || 24;
+  try {
+    const resp = await api(`/api/sessions/${sessionId}/term/attach`, {
+      method: 'POST',
+      body: JSON.stringify({ cols, rows }),
+    });
+    if (state.activeSessionId !== sessionId) return; // user switched again mid-flight
+    if (resp.replay) t.term.write(resp.replay);
+    t.attachedSessionId = sessionId;
+  } catch (e) {
+    t.term.write(`\r\n\x1b[31m终端连接失败：${e.message}\x1b[0m\r\n`);
+  }
+}
+
+let pendingInput = '';
+let inputFlushTimer = null;
+
+function sendTerminalInput(data) {
+  if (!state.activeSessionId) return;
+  pendingInput += data;
+  if (inputFlushTimer) return;
+  inputFlushTimer = setTimeout(flushTerminalInput, 8);
+}
+
+async function flushTerminalInput() {
+  inputFlushTimer = null;
+  const data = pendingInput;
+  pendingInput = '';
+  if (!data || !state.activeSessionId) return;
+  try {
+    await api(`/api/sessions/${state.activeSessionId}/term/input`, {
+      method: 'POST',
+      body: JSON.stringify({ data }),
+    });
+  } catch (e) {
+    console.warn('term input failed', e);
+  }
+}
+
+let resizeDebounce = null;
+function sendTerminalResize(cols, rows) {
+  if (!state.activeSessionId) return;
+  clearTimeout(resizeDebounce);
+  resizeDebounce = setTimeout(() => {
+    api(`/api/sessions/${state.activeSessionId}/term/resize`, {
+      method: 'POST',
+      body: JSON.stringify({ cols, rows }),
+    }).catch(() => {});
+  }, 80);
+}
+
+async function restartTerminal() {
+  if (!state.activeSessionId) return;
+  try {
+    await api(`/api/sessions/${state.activeSessionId}/term/kill`, { method: 'POST' });
+  } catch {}
+  if (state.terminal) state.terminal.attachedSessionId = null;
+  attachTerminalToActiveSession();
+}
+
+function toggleTerminalFullscreen() {
+  const panel = $('#terminalPanel');
+  if (!panel) return;
+  const next = !panel.classList.contains('fullscreen');
+  panel.classList.toggle('fullscreen', next);
+  const btn = $('#terminalFullscreenBtn');
+  if (btn) btn.textContent = next ? '⛶ 退出全屏' : '⛶ 全屏';
+  // Refit xterm after the layout change so cols/rows reflect the new size.
+  // ResizeObserver also fires, but a direct fit avoids a one-frame mismatch.
+  setTimeout(() => {
+    try { state.terminal?.fit?.fit(); } catch {}
+  }, 30);
+}
+
+function renderTerminal() {
+  const cwdEl = $('#terminalCwd');
+  const workdir = state.detail?.session?.workdir || '(未选择会话)';
+  if (cwdEl) cwdEl.textContent = workdir;
+  attachTerminalToActiveSession();
 }
 
 init().catch((err) => {

@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "postinstall": "chmod +x node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true"
   },
   "engines": {
     "node": ">=18"
@@ -14,6 +15,7 @@
   "license": "MIT",
   "dependencies": {
     "madge": "^8.0.0",
+    "node-pty": "^1.1.0",
     "typescript": "^6.0.3"
   }
 }

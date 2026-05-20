@@ -19,6 +19,7 @@ import { extractHabits } from './src/habitExtractor.js';
 import { distillExperiences } from './src/memoryDistiller.js';
 import { mergeHabit, mergeExperience, hashWorkdir } from './src/memoryEngine.js';
 import { relevantForPrompt } from './src/memoryRetriever.js';
+import { TerminalManager } from './src/terminalManager.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -41,10 +42,15 @@ for (const persisted of store.loadAll()) {
 }
 const sseClients = new Set();
 
+const terminals = new TerminalManager({ broadcast });
+
 manager.on('session:event', (payload) => broadcast('event', payload));
 manager.on('session:updated', (payload) => broadcast('session:updated', payload));
 manager.on('session:created', (payload) => broadcast('session:created', payload));
-manager.on('session:removed', (payload) => broadcast('session:removed', payload));
+manager.on('session:removed', (payload) => {
+  broadcast('session:removed', payload);
+  terminals.kill(payload.id);
+});
 
 function broadcast(kind, data) {
   const line = `event: ${kind}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -324,7 +330,8 @@ const server = http.createServer(async (req, res) => {
         let experiences = [];
         let distillError = null;
         if (body.includeExperiences !== false) {
-          const result = await distillExperiences({ session, turnId });
+          const guidance = typeof body.guidance === 'string' ? body.guidance.slice(0, 1000) : '';
+          const result = await distillExperiences({ session, turnId, guidance });
           if (result.error) distillError = result.error;
           else experiences = result.items.map((it) => ({
             ...it,
@@ -335,6 +342,35 @@ const server = http.createServer(async (req, res) => {
           }));
         }
         return json(res, 200, { habits, experiences, distillError });
+      }
+
+      if (rest === '/term/attach' && req.method === 'POST') {
+        const body = await readJson(req).catch(() => ({}));
+        const cols = body.cols | 0 || 80;
+        const rows = body.rows | 0 || 24;
+        terminals.ensure(session, { cols, rows });
+        terminals.resize(session.id, cols, rows);
+        return json(res, 200, { ok: true, replay: terminals.replay(session.id) });
+      }
+
+      if (rest === '/term/input' && req.method === 'POST') {
+        const body = await readJson(req).catch(() => ({}));
+        const data = typeof body.data === 'string' ? body.data : '';
+        if (!data) return json(res, 400, { error: 'data 必填' });
+        terminals.ensure(session);
+        const ok = terminals.write(session.id, data);
+        return json(res, ok ? 200 : 500, { ok });
+      }
+
+      if (rest === '/term/resize' && req.method === 'POST') {
+        const body = await readJson(req).catch(() => ({}));
+        const ok = terminals.resize(session.id, body.cols | 0, body.rows | 0);
+        return json(res, ok ? 200 : 404, { ok });
+      }
+
+      if (rest === '/term/kill' && req.method === 'POST') {
+        const ok = terminals.kill(session.id);
+        return json(res, 200, { ok });
       }
 
       if (rest === '/gitnexus/status' && req.method === 'GET') {
@@ -407,6 +443,7 @@ function json(res, status, body) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(body));
 }
+
 
 function readJson(req) {
   return new Promise((resolve, reject) => {
