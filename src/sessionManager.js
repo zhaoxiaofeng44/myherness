@@ -557,6 +557,17 @@ class Session {
     // the meantime — bail if the approval is no longer pending.
     if (!this.pendingApprovals.has(record.id)) return;
 
+    // 用户已点击「我自己决定」：哪怕 verdict 在飞行中已经算出结果，也不能
+    // 覆盖人工接管 —— 保留 pending 状态，让用户继续手填答案。
+    if (record.deciderState === 'cancelled') {
+      this._record({
+        type: 'memory:decision-discarded',
+        toolUseId: record.id,
+        reason: 'user-cancelled-before-verdict',
+      });
+      return;
+    }
+
     if (!verdict || verdict.error || verdict.skipped) {
       record.deciderState = verdict?.skipped ? 'skipped' : 'error';
       this._record({
@@ -591,8 +602,23 @@ class Session {
 
     // Confident — auto-resolve.
     if (isAUQ) {
-      const synthesizedNote = `[记忆助手自动作答 confidence=${confidence.toFixed(2)}] ${decision}`;
       const auqAnswers = synthesizeAUQAnswers(record.input, decision);
+      // 没"具体选择"就不算自动作答。decider 的 label 没匹配上任何 option
+      // 时（罕见但可能发生），落回人工等待，避免提交空答案直接关弹窗。
+      if (auqAnswers.length === 0) {
+        record.deciderState = 'uncertain';
+        record.deciderReason = `记忆助手给出的答案「${decision}」未匹配到任何选项`;
+        this._record({
+          type: 'memory:decision-uncertain',
+          toolUseId: record.id,
+          confidence,
+          reason: record.deciderReason,
+          usedMemoryIds: usedMemoryIds || [],
+        });
+        this._broadcastSummary();
+        return;
+      }
+      const synthesizedNote = `[记忆助手自动作答 confidence=${confidence.toFixed(2)}] ${decision}`;
       this._record({
         type: 'memory:decided',
         toolUseId: record.id,
