@@ -200,7 +200,9 @@ class Session {
   }
 
   // ===== Turn execution =====
-  async sendPrompt(prompt) {
+  // opts.fromAUQ: 这一轮是 AUQ 回答自动接续而来的；前端聊天流靠这个标记
+  // 跳过 turn:start 里的 user 气泡，避免和 approval:resolved 的回答回显重复。
+  async sendPrompt(prompt, opts = {}) {
     if (this.activeChild) throw new Error('当前会话已有运行中的对话');
     const policy = getPolicy(this.policyId);
     const turnId = `t${this.turns.length + 1}`;
@@ -216,7 +218,7 @@ class Session {
     this.activeTurn = turn;
 
     this.status = 'running';
-    this._record({ type: 'turn:start', turnId, prompt, policyId: policy.id });
+    this._record({ type: 'turn:start', turnId, prompt, policyId: policy.id, fromAUQ: !!opts.fromAUQ });
     this._broadcastSummary();
 
     // Take a snapshot before running so we can diff afterwards.
@@ -670,9 +672,9 @@ class Session {
     return `<memory>\n${block}\n</memory>\n\n${prompt}`;
   }
 
-  // The user may resolve a pending manual approval from the UI. Because the
-  // CLI already executed (or was prevented) by --permission-mode, this resolve
-  // is informational/audit-only. We still track it so the UX is honest.
+  // The user may resolve a pending manual approval from the UI. For普通工具
+  // 而言这是审计性质（CLI 端已被 --permission-mode 决定）；对 AskUserQuestion
+  // 则会把回答自动作为下一轮 prompt 发回 Claude，让任务接着走下去。
   resolveApproval(toolUseId, decision, note, extra = {}) {
     const rec = this.pendingApprovals.get(toolUseId);
     if (!rec) return false;
@@ -680,19 +682,72 @@ class Session {
     rec.decision = decision; // 'auto' (approved) | 'reject'
     rec.manualResolution = decision;
     rec.manualNote = note || '';
-    if (extra && extra.auqAnswers) rec.auqAnswers = extra.auqAnswers;
+    const auqAnswers = extra && extra.auqAnswers;
+    if (auqAnswers) rec.auqAnswers = auqAnswers;
     this._record({
       type: 'approval:resolved',
       toolUseId,
       decision,
       note: note || '',
-      auqAnswers: extra && extra.auqAnswers ? extra.auqAnswers : undefined,
+      auqAnswers: auqAnswers ? auqAnswers : undefined,
     });
     if (this.pendingApprovals.size === 0 && this.status === 'waiting') {
       this.status = this.activeChild ? 'running' : 'idle';
     }
     this._broadcastSummary();
+
+    // AskUserQuestion 接续：用户通过/记忆助手自动作答时，把回答当作下一轮
+    // prompt 自动发送，触发 claude --resume 继续会话。reject 则不接续。
+    if (rec.tool === 'AskUserQuestion' && decision === 'auto') {
+      const hasPicks = Array.isArray(auqAnswers) && auqAnswers.length > 0;
+      const hasNote = (note || '').trim().length > 0;
+      if (hasPicks || hasNote) {
+        this._queueAUQFollowUp({ auqAnswers: auqAnswers || [], note: note || '' });
+      }
+    }
     return true;
+  }
+
+  _queueAUQFollowUp({ auqAnswers, note }) {
+    // 多个 AUQ 同轮少见，但若发生只接续第一个回答，避免连发多个 prompt。
+    if (this._pendingFollowUp) return;
+    // submitAskUserQuestion 已把选项 + 自由输入 + 备注拼进 note；空时回退用
+    // 结构化 auqAnswers 拼一份，确保 Claude 一定能收到具体内容。
+    let body = (note || '').trim();
+    if (!body && Array.isArray(auqAnswers)) {
+      body = auqAnswers
+        .map((a) => {
+          const q = (a.question || '').trim() || '（无问题文本）';
+          const picked = Array.isArray(a.picked) ? a.picked.filter(Boolean) : [];
+          return `• ${q}\n  → ${picked.length ? picked.join(' / ') : '（未选）'}`;
+        })
+        .join('\n');
+    }
+    if (!body) return;
+    // CLI 在非交互模式（stdin=ignore）会给 AskUserQuestion 自动塞一条
+    // 「user cancelled / 非交互」的 tool_result，--resume 后 Claude 会先读到
+    // 它、然后才读到我们追发的回答，于是误以为用户真的取消了。
+    // 这里把回答包一层显式说明，盖过那条默认 tool_result。
+    const prompt = [
+      '我刚才在 AskUserQuestion 弹窗里实际给出了下面的回答（请忽略 CLI 在非交互模式下',
+      '自动填充的「取消 / 未应答」tool_result，那是默认行为，不代表我的真实选择）：',
+      '',
+      body,
+      '',
+      '请基于上述回答继续之前的任务。',
+    ].join('\n');
+
+    if (this.activeChild) {
+      // 当前轮还没退出（罕见——AUQ 多数情况下 CLI 已结束），落到 _afterTurnFinish 再发。
+      this._pendingFollowUp = prompt;
+    } else {
+      // 异步发起新轮，避免在 resolveApproval 的同步调用栈里直接 spawn。
+      setImmediate(() => {
+        this.sendPrompt(prompt, { fromAUQ: true }).catch((e) => {
+          this._record({ type: 'turn:error', error: 'AUQ 接续失败: ' + e.message });
+        });
+      });
+    }
   }
 
   // Cancel an in-flight decider and let the user take over.
@@ -768,6 +823,20 @@ class Session {
     this.activeTurn = null;
     this.status = reason === 'error' ? 'error' : 'idle';
     this._broadcastSummary();
+
+    // 排空 AUQ 接续：上一轮里用户回答的内容，作为新一轮 prompt 自动发出。
+    // 仅在非 error 终态触发，避免上一轮失败后还硬接续。
+    if (this._pendingFollowUp && reason !== 'error') {
+      const p = this._pendingFollowUp;
+      this._pendingFollowUp = null;
+      setImmediate(() => {
+        this.sendPrompt(p, { fromAUQ: true }).catch((e) => {
+          this._record({ type: 'turn:error', error: 'AUQ 接续失败: ' + e.message });
+        });
+      });
+    } else if (this._pendingFollowUp) {
+      this._pendingFollowUp = null;
+    }
   }
 
   _record(event) {

@@ -738,7 +738,9 @@ function renderChatView() {
         kind: 'divider',
         text: `第 ${e.turnId} 轮 · ${fmtTime(e.ts)}`,
       });
-      items.push({ kind: 'user', text: e.prompt, ts: e.ts });
+      // AUQ 接续轮的 prompt 已经在 approval:resolved 那里以「我的回答」回显
+      // 过，跳过重复的 user 气泡。
+      if (!e.fromAUQ) items.push({ kind: 'user', text: e.prompt, ts: e.ts });
     } else if (e.type === 'assistant:text') {
       items.push({ kind: 'assistant', text: e.text, ts: e.ts });
     } else if (e.type === 'assistant:thinking') {
@@ -783,6 +785,29 @@ function renderChatView() {
         text: `Claude session ${e.raw?.session_id || ''} 已初始化`,
         ts: e.ts,
       });
+    } else if (e.type === 'approval:resolved') {
+      // AUQ 回答即时回显：避免提交后到下一轮 turn:start 之间留白，让用户
+      // 立刻看到自己选了什么；非 AUQ 的审批不在聊天流里渲染（仍属审计）。
+      const auq = Array.isArray(e.auqAnswers) ? e.auqAnswers : null;
+      const noteText = (e.note || '').trim();
+      const hasAUQ = auq && auq.length > 0;
+      if (hasAUQ || (noteText && e.decision === 'auto')) {
+        const lines = [];
+        if (hasAUQ) {
+          for (const a of auq) {
+            const q = (a.question || '').trim();
+            const picks = Array.isArray(a.picked) ? a.picked.join(' / ') : '';
+            lines.push(`• ${q || '（无问题文本）'}\n  → ${picks || '（未选）'}`);
+          }
+        } else if (noteText) {
+          lines.push(noteText);
+        }
+        items.push({
+          kind: 'user',
+          text: '我的回答：\n' + lines.join('\n'),
+          ts: e.ts,
+        });
+      }
     }
   }
 
@@ -795,15 +820,68 @@ function renderChatView() {
   );
 
   // Approval panel
+  // 每个后端事件都会触发 renderChatView，所以这里每次都会重写 approval pane
+  // 的 innerHTML —— 不做防护的话，用户正在 AUQ 卡片里选的 .selected chip
+  // 和已填的 textarea 会被瞬间清空，体感是「我刚选完就被覆盖了」。
+  // 渲染前 snapshot 选中 / 文本，渲染后恢复，避免破坏用户正在进行的输入。
   const approvals = state.detail.pendingApprovals || [];
+  const approvalSnap = snapshotApprovalPaneState();
   if (approvals.length === 0) {
     $('#approvalPane').innerHTML = '';
   } else {
     $('#approvalPane').innerHTML = approvals.map(renderApprovalCard).join('');
     wireApprovalCards();
+    restoreApprovalPaneState(approvalSnap);
   }
 
   insertDepositButtons();
+}
+
+function snapshotApprovalPaneState() {
+  const pane = $('#approvalPane');
+  if (!pane) return null;
+  const snap = {};
+  pane.querySelectorAll('.approval-card').forEach((card) => {
+    const id = card.dataset.id;
+    if (!id) return;
+    const selections = [];
+    card.querySelectorAll('.auq-option.selected').forEach((b) => {
+      selections.push({ qi: b.dataset.q, opt: b.dataset.opt });
+    });
+    const texts = {};
+    card.querySelectorAll('textarea').forEach((t) => {
+      let key = '';
+      if (t.dataset.note) key = 'note:' + t.dataset.note;
+      else if (t.dataset.qi != null) key = 'qi:' + t.dataset.qi;
+      if (key) texts[key] = t.value;
+    });
+    snap[id] = { selections, texts };
+  });
+  return snap;
+}
+
+function restoreApprovalPaneState(snap) {
+  if (!snap) return;
+  const pane = $('#approvalPane');
+  if (!pane) return;
+  for (const id in snap) {
+    const card = pane.querySelector(`.approval-card[data-id="${id}"]`);
+    if (!card) continue;
+    for (const { qi, opt } of snap[id].selections) {
+      const btn = card.querySelector(`.auq-option[data-q="${qi}"][data-opt="${opt}"]`);
+      if (btn) btn.classList.add('selected');
+    }
+    for (const key in snap[id].texts) {
+      const sepIdx = key.indexOf(':');
+      const kind = key.slice(0, sepIdx);
+      const k = key.slice(sepIdx + 1);
+      const sel = kind === 'note'
+        ? `textarea[data-note="${k}"]`
+        : `textarea[data-qi="${k}"]`;
+      const t = card.querySelector(sel);
+      if (t) t.value = snap[id].texts[key];
+    }
+  }
 }
 
 // Approval card rendering. AskUserQuestion gets an interactive form (option
@@ -922,6 +1000,11 @@ function wireApprovalCards() {
     btn.addEventListener('click', () => {
       const qi = btn.dataset.q;
       const card = btn.closest('.auq-card');
+      // 用户开始动手作答时，立刻取消同卡片仍在飞行中的后台 decider，避免
+      // decider 在用户点完选项、还没点提交前就抢先 resolveApproval 触发下一轮。
+      if (card?.classList.contains('approval-decider-pending') && card.dataset.id) {
+        cancelDecider(card.dataset.id);
+      }
       const questionEl = card.querySelector(`.auq-question[data-qi="${qi}"]`);
       const multi = questionEl.querySelector('.auq-multi') != null;
       if (!multi) {
