@@ -1,0 +1,13 @@
+Claude Code Console running at http://localhost:4477
+Working directory: /Users/tbsg/myCli
+Session data dir: /Users/tbsg/myCli/.claude-console/sessions
+Memory file: /Users/tbsg/myCli/.claude-console/memory.json
+ReferenceError: url is not defined
+    at Server.<anonymous> (file:///Users/tbsg/myCli/server.js:94:21)
+    at Server.emit (node:events:509:28)
+    at parserOnIncoming (node:_http_server:1213:12)
+    at HTTPParser.parserOnHeadersComplete (node:_http_common:125:17)
+Claude Code Console running at http://localhost:4477
+Working directory: /Users/tbsg/myCli
+Session data dir: /Users/tbsg/myCli/.claude-console/sessions
+Memory file: /Users/tbsg/myCli/.claude-console/memory.json

@@ -10,8 +10,8 @@ const NPX = process.platform === 'win32' ? 'npx.cmd' : 'npx';
 
 let _availability = null;
 
-export async function isAvailable() {
-  if (_availability) return _availability;
+export async function isAvailable({ force = false } = {}) {
+  if (_availability && !force) return _availability;
   try {
     const { stdout, code } = await runCli(['--version'], { timeoutMs: 30_000 });
     if (code === 0) {

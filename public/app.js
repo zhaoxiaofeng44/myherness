@@ -30,6 +30,10 @@ const state = {
   gitNexusImpactSymbol: '',
   gitNexusAnalyzing: false,
   gitNexusLog: [],
+  gitNexusHierarchy: null,         // { root, crossEdges, topByName, nodeFnCount }
+  gitNexusHierarchyRoot: [],       // drill-down path, e.g. ['src']
+  gitNexusHierarchySelected: null, // selected path string for detail pane
+  gitNexusHierarchyHover: null,    // hovered top-level module name (for x-mod edges)
   memory: null,           // { entries: [...] }
   memoryTab: 'habit',     // 'habit' | 'experience'
   memoryFilterScope: 'all', // 'all' | 'workdir'
@@ -321,6 +325,10 @@ function connectEvents() {
     state.gitNexusStatus = null;
     state.gitNexusCallGraph = null;
     state.gitNexusProcesses = null;
+    state.gitNexusHierarchy = null;
+    state.gitNexusHierarchyRoot = [];
+    state.gitNexusHierarchySelected = null;
+    state.gitNexusHierarchyHover = null;
     if (state.view === 'structure' && state.structureTab === 'gitnexus') {
       loadGitNexusStatus();
       renderGitNexusLog();
@@ -518,6 +526,10 @@ async function selectSession(id) {
   state.gitNexusImpactSymbol = '';
   state.gitNexusAnalyzing = false;
   state.gitNexusLog = [];
+  state.gitNexusHierarchy = null;
+  state.gitNexusHierarchyRoot = [];
+  state.gitNexusHierarchySelected = null;
+  state.gitNexusHierarchyHover = null;
   await loadDetail();
   renderSessionList();
   renderAll();
@@ -557,6 +569,10 @@ function handleSessionEvent(evt) {
     state.gitNexusProcesses = null;
     state.gitNexusImpact = null;
     state.gitNexusStatus = null; // index becomes stale
+    state.gitNexusHierarchy = null;
+    state.gitNexusHierarchyRoot = [];
+    state.gitNexusHierarchySelected = null;
+    state.gitNexusHierarchyHover = null;
   }
   if (evt.type === 'turn:start') {
     state.detail.turns.push({
@@ -2282,6 +2298,9 @@ function reloadGitNexusSubview(force) {
   if (sub === 'callgraph') {
     if (force || !state.gitNexusCallGraph) loadGitNexusCallGraph();
     else renderGitNexusPane();
+  } else if (sub === 'hierarchy') {
+    if (force) { state.gitNexusHierarchy = null; state.gitNexusCallGraph = null; }
+    loadGitNexusHierarchy();
   } else if (sub === 'processes') {
     if (force || !state.gitNexusProcesses) loadGitNexusProcesses();
     else renderGitNexusPane();
@@ -2396,6 +2415,7 @@ async function runGitNexusImpact(symbol) {
 function renderGitNexusPane() {
   const sub = state.gitNexusSubtab;
   if (sub === 'callgraph') return renderGitNexusCallGraph();
+  if (sub === 'hierarchy') return renderGitNexusHierarchy();
   if (sub === 'processes') return renderGitNexusProcesses();
   if (sub === 'impact') return renderGitNexusImpact();
 }
@@ -2541,6 +2561,344 @@ function renderGitNexusCallGraph() {
     }
   } else {
     detail.innerHTML = '<div class="muted">点击节点查看详情。也可在上方搜索框输入函数名/文件名过滤节点。</div>';
+  }
+}
+
+// ===== Hierarchy (icicle) view =====
+
+function buildHierarchyFromCallGraph(g) {
+  const root = { name: '/', path: [], children: new Map(), leafCount: 0, fnCount: 0,
+                 inDeg: 0, outDeg: 0, isLeaf: false, nodeIds: [] };
+  const topOf = (file) => {
+    if (!file) return '<unknown>';
+    const norm = file.replace(/^\.?\/+/, '');
+    const seg = norm.split(/[\\/]/).filter(Boolean);
+    return seg[0] || '<unknown>';
+  };
+  const segmentsOf = (file) => {
+    if (!file) return ['<unknown>'];
+    const norm = file.replace(/^\.?\/+/, '');
+    return norm.split(/[\\/]/).filter(Boolean);
+  };
+
+  for (const n of g.nodes) {
+    const segs = segmentsOf(n.file);
+    // path: [seg1, seg2, ..., filename, fnName]
+    const path = segs.concat([n.name || '(anonymous)']);
+    let cur = root;
+    for (let depth = 0; depth < path.length; depth++) {
+      const part = path[depth];
+      let child = cur.children.get(part);
+      if (!child) {
+        child = { name: part, path: path.slice(0, depth + 1), children: new Map(),
+                  leafCount: 0, fnCount: 0, inDeg: 0, outDeg: 0,
+                  isLeaf: depth === path.length - 1, nodeIds: [], file: depth === path.length - 1 ? n.file : null };
+        cur.children.set(part, child);
+      }
+      cur = child;
+    }
+    cur.nodeIds.push(n.id);
+    cur.inDeg = (cur.inDeg || 0) + (n.inDeg || 0);
+    cur.outDeg = (cur.outDeg || 0) + (n.outDeg || 0);
+  }
+
+  // Recursive rollup
+  const rollup = (node) => {
+    if (node.isLeaf) {
+      node.leafCount = 1;
+      node.fnCount = 1;
+      return;
+    }
+    let lc = 0, fc = 0, ind = 0, outd = 0;
+    for (const c of node.children.values()) {
+      rollup(c);
+      lc += c.leafCount;
+      fc += c.fnCount;
+      ind += c.inDeg;
+      outd += c.outDeg;
+    }
+    node.leafCount = Math.max(lc, 1);
+    node.fnCount = fc;
+    node.inDeg = ind;
+    node.outDeg = outd;
+  };
+  rollup(root);
+
+  // Top-level lookup for cross-module edges
+  const topByNodeId = new Map();
+  for (const n of g.nodes) topByNodeId.set(n.id, topOf(n.file));
+
+  const crossEdges = new Map(); // "A→B" -> { from, to, count }
+  for (const e of g.edges) {
+    const a = topByNodeId.get(e.from);
+    const b = topByNodeId.get(e.to);
+    if (!a || !b || a === b) continue;
+    const key = a + '→' + b;
+    const rec = crossEdges.get(key);
+    if (rec) rec.count++;
+    else crossEdges.set(key, { from: a, to: b, count: 1 });
+  }
+
+  return { root, crossEdges, topByNodeId };
+}
+
+async function loadGitNexusHierarchy() {
+  if (!state.activeSessionId) return;
+  const pane = $('#gitNexusPane');
+  if (!state.gitNexusCallGraph) {
+    pane.innerHTML = '<div class="muted" style="padding:14px">读取调用图（cypher）…</div>';
+    try {
+      const resp = await api(`/api/sessions/${state.activeSessionId}/gitnexus/tool`, {
+        method: 'POST',
+        body: JSON.stringify({ kind: 'callgraph', args: { limit: 300 } }),
+      });
+      state.gitNexusCallGraph = resp.result;
+    } catch (e) {
+      pane.innerHTML = `<div class="muted" style="padding:14px">读取失败：${escapeHtml(e.message)}<br/>提示：可能未索引，请先点击上方「索引仓库」。</div>`;
+      return;
+    }
+  }
+  state.gitNexusHierarchy = buildHierarchyFromCallGraph(state.gitNexusCallGraph);
+  state.gitNexusHierarchySelected = null;
+  state.gitNexusHierarchyHover = null;
+  renderGitNexusHierarchy();
+}
+
+function getHierarchyNodeAt(root, path) {
+  let cur = root;
+  for (const part of path) {
+    if (!cur.children) return null;
+    cur = cur.children.get(part);
+    if (!cur) return null;
+  }
+  return cur;
+}
+
+function renderGitNexusHierarchy() {
+  const pane = $('#gitNexusPane');
+  const h = state.gitNexusHierarchy;
+  const g = state.gitNexusCallGraph;
+  if (!h || !g) return;
+  if (!g.nodes || g.nodes.length === 0) {
+    pane.innerHTML = '<div class="muted" style="padding:14px">调用图为空。如果仓库已索引，可能是该语言尚未支持函数调用解析。</div>';
+    return;
+  }
+
+  const rootPath = state.gitNexusHierarchyRoot || [];
+  const subRoot = getHierarchyNodeAt(h.root, rootPath) || h.root;
+  const crumbHtml = (() => {
+    const parts = [`<a href="#" class="gn-crumb" data-depth="0">/</a>`];
+    rootPath.forEach((p, i) => {
+      parts.push(`<span class="gn-crumb-sep">›</span><a href="#" class="gn-crumb" data-depth="${i + 1}">${escapeHtml(p)}</a>`);
+    });
+    return parts.join('');
+  })();
+
+  pane.innerHTML = `
+    <div class="gn-graph-grid">
+      <div class="graph-pane">
+        <div class="gn-icicle-bar">
+          <div class="breadcrumb">${crumbHtml}</div>
+          <div class="muted" style="font-size:11px">节点 ${g.nodes.length} · 边 ${g.edges.length} · 跨模块依赖 ${h.crossEdges.size} 条 · 点击下钻 · hover 显示虚线依赖</div>
+        </div>
+        <svg id="gnHierarchySvg" class="gn-icicle module-graph"></svg>
+      </div>
+      <div id="gnHierarchyDetail" class="structure-detail">点击方块查看详情；点击非叶子块下钻。</div>
+    </div>`;
+
+  $$('#gitNexusPane .gn-crumb').forEach((a) => a.addEventListener('click', (e) => {
+    e.preventDefault();
+    const d = parseInt(a.dataset.depth, 10) || 0;
+    state.gitNexusHierarchyRoot = rootPath.slice(0, d);
+    state.gitNexusHierarchySelected = null;
+    state.gitNexusHierarchyHover = null;
+    renderGitNexusHierarchy();
+  }));
+
+  const svg = $('#gnHierarchySvg');
+  const rect = svg.getBoundingClientRect();
+  const W = Math.max(rect.width, 400);
+  const H = Math.max(rect.height, 300);
+
+  // Compute layers from subRoot — children, grandchildren, etc.
+  const search = (state.structureSearch || '').toLowerCase();
+  const matchesNode = (node) => {
+    if (!search) return true;
+    if (node.isLeaf) {
+      const name = (node.name || '').toLowerCase();
+      const file = (node.file || '').toLowerCase();
+      return name.includes(search) || file.includes(search);
+    }
+    for (const c of node.children.values()) if (matchesNode(c)) return true;
+    return false;
+  };
+
+  const layers = []; // [[cells], [cells], ...]
+  const layout = (node, x0, y0, h, depth) => {
+    if (!node.children || node.children.size === 0) return;
+    const total = Array.from(node.children.values()).reduce((s, c) => s + c.leafCount, 0) || 1;
+    const layerW = Math.min(180, Math.max(80, (W - 20) / Math.max(maxDepth, 1)));
+    let y = y0;
+    const cells = layers[depth] || (layers[depth] = []);
+    for (const c of node.children.values()) {
+      const ch = (c.leafCount / total) * h;
+      cells.push({ node: c, x: x0, y, w: layerW, h: ch, depth });
+      layout(c, x0 + layerW, y, ch, depth + 1);
+      y += ch;
+    }
+  };
+  // Determine max depth from subRoot
+  let maxDepth = 0;
+  (function depth(n, d) { maxDepth = Math.max(maxDepth, d); if (n.children) for (const c of n.children.values()) depth(c, d + 1); })(subRoot, 0);
+  maxDepth = Math.max(maxDepth, 1);
+  layout(subRoot, 10, 10, H - 20, 0);
+
+  const ns = 'http://www.w3.org/2000/svg';
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  const defs = document.createElementNS(ns, 'defs');
+  defs.innerHTML = `
+    <marker id="gn-arrow-dash" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" />
+    </marker>`;
+  svg.appendChild(defs);
+
+  const selectedPathStr = state.gitNexusHierarchySelected;
+  const hoverTop = state.gitNexusHierarchyHover;
+
+  // Render cells
+  const cellLayer = document.createElementNS(ns, 'g');
+  cellLayer.setAttribute('class', 'cells');
+  svg.appendChild(cellLayer);
+
+  // Top-level cells (depth 0 under subRoot). Their absolute top-level name
+  // is rootPath[0] (if drilled in) or each cell's own name (if at /).
+  const absTopName = (cell) => rootPath.length > 0 ? rootPath[0] : cell.node.name;
+
+  for (const cells of layers) {
+    for (const cell of cells) {
+      const { node, x, y, w, h: ch, depth } = cell;
+      if (ch < 1) continue;
+      const grp = document.createElementNS(ns, 'g');
+      let cls = `cell depth-${depth}`;
+      if (node.isLeaf) cls += ' leaf';
+      const pathStr = node.path.join('/');
+      if (selectedPathStr === pathStr) cls += ' selected';
+      if (!matchesNode(node)) cls += ' dim';
+      grp.setAttribute('class', cls);
+      grp.setAttribute('transform', `translate(${x},${y})`);
+      grp.dataset.path = pathStr;
+      grp.dataset.top = absTopName(cell);
+
+      const r = document.createElementNS(ns, 'rect');
+      r.setAttribute('width', Math.max(w - 2, 1));
+      r.setAttribute('height', Math.max(ch - 2, 1));
+      r.setAttribute('rx', 3);
+      grp.appendChild(r);
+
+      if (ch >= 14) {
+        const t = document.createElementNS(ns, 'text');
+        t.setAttribute('class', 'label');
+        t.setAttribute('x', 6);
+        t.setAttribute('y', Math.min(14, ch / 2 + 4));
+        const label = node.isLeaf
+          ? node.name
+          : `${node.name} · ${node.fnCount}`;
+        t.textContent = label.length > 28 ? label.slice(0, 27) + '…' : label;
+        grp.appendChild(t);
+      }
+
+      grp.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        state.gitNexusHierarchySelected = pathStr;
+        if (!node.isLeaf && node.children.size > 0) {
+          state.gitNexusHierarchyRoot = node.path.slice();
+        }
+        renderGitNexusHierarchy();
+      });
+
+      cellLayer.appendChild(grp);
+    }
+  }
+
+  // Cross-module edge layer (top of cells)
+  const xmodLayer = document.createElementNS(ns, 'g');
+  xmodLayer.setAttribute('class', 'xmod');
+  svg.appendChild(xmodLayer);
+
+  function renderXmodEdges() {
+    while (xmodLayer.firstChild) xmodLayer.removeChild(xmodLayer.firstChild);
+    if (!hoverTopRef.value) return;
+    // Only meaningful at top-level (rootPath empty). When drilled in, every
+    // visible block belongs to rootPath[0], so cross-module = nothing visible.
+    if (rootPath.length > 0) return;
+    // Find depth-0 cells (top-level modules currently visible).
+    const topCells = (layers[0] || []).filter((c) => matchesNode(c.node));
+    const centerOf = (name) => {
+      const c = topCells.find((tc) => tc.node.name === name);
+      if (!c) return null;
+      return { x: c.x + c.w / 2, y: c.y + c.h / 2, top: c.y, bottom: c.y + c.h };
+    };
+    for (const rec of h.crossEdges.values()) {
+      if (rec.from !== hoverTopRef.value && rec.to !== hoverTopRef.value) continue;
+      const a = centerOf(rec.from);
+      const b = centerOf(rec.to);
+      if (!a || !b) continue;
+      const path = document.createElementNS(ns, 'path');
+      const midX = (a.x + b.x) / 2 + 60;
+      const d = `M ${a.x} ${a.y} Q ${midX} ${(a.y + b.y) / 2} ${b.x} ${b.y}`;
+      path.setAttribute('d', d);
+      path.setAttribute('class', 'x-mod-edge');
+      path.setAttribute('marker-end', 'url(#gn-arrow-dash)');
+      path.setAttribute('stroke-width', Math.min(1 + Math.log2(rec.count + 1), 4));
+      xmodLayer.appendChild(path);
+    }
+  }
+  const hoverTopRef = { value: hoverTop };
+  $$('#gnHierarchySvg .cell').forEach((g) => {
+    g.addEventListener('mouseenter', () => { hoverTopRef.value = g.dataset.top; renderXmodEdges(); });
+    g.addEventListener('mouseleave', () => { hoverTopRef.value = null; renderXmodEdges(); });
+  });
+  renderXmodEdges();
+
+  // Detail pane
+  const detail = $('#gnHierarchyDetail');
+  if (selectedPathStr) {
+    const node = getHierarchyNodeAt(h.root, selectedPathStr.split('/'));
+    if (node) {
+      const incomingXmod = [];
+      const outgoingXmod = [];
+      if (!rootPath.length || node.path[0] === rootPath[0]) {
+        const topName = node.path[0];
+        for (const rec of h.crossEdges.values()) {
+          if (rec.to === topName && rec.from !== topName) incomingXmod.push(rec);
+          if (rec.from === topName && rec.to !== topName) outgoingXmod.push(rec);
+        }
+      }
+      detail.innerHTML = `
+        <h3 style="margin-top:0">${escapeHtml(node.name)}${node.isLeaf ? '' : ' /'}</h3>
+        <div class="muted" style="font-family:var(--mono);font-size:11px;margin-bottom:10px">${escapeHtml(node.path.join('/'))}</div>
+        <div>${node.isLeaf ? '函数节点' : `${node.fnCount} 个函数 · ${node.children.size} 个子项`}</div>
+        <div style="margin-top:6px">入度合计 ${node.inDeg} · 出度合计 ${node.outDeg}</div>
+        ${node.file ? `<div class="muted" style="margin-top:6px">来源：<code>${escapeHtml(node.file)}</code></div>` : ''}
+        <h4 style="margin-top:14px;margin-bottom:6px">跨模块入边（${incomingXmod.length}）</h4>
+        <ul style="padding-left:18px;margin:0">
+          ${incomingXmod.length === 0 ? '<li class="muted">无</li>' : incomingXmod.slice(0, 30).map((r) => `<li><code>${escapeHtml(r.from)}</code> → ${r.count} 次</li>`).join('')}
+        </ul>
+        <h4 style="margin-top:14px;margin-bottom:6px">跨模块出边（${outgoingXmod.length}）</h4>
+        <ul style="padding-left:18px;margin:0">
+          ${outgoingXmod.length === 0 ? '<li class="muted">无</li>' : outgoingXmod.slice(0, 30).map((r) => `<li><code>${escapeHtml(r.to)}</code> ← ${r.count} 次</li>`).join('')}
+        </ul>
+        ${node.isLeaf ? `<div class="actions" style="margin-top:14px"><button class="ghost-btn" id="gnHierUseImpact">在「影响分析」中查看</button></div>` : ''}`;
+      const btn = $('#gnHierUseImpact');
+      if (btn) btn.addEventListener('click', () => {
+        switchGitNexusSubtab('impact');
+        runGitNexusImpact(node.name);
+      });
+    } else {
+      detail.innerHTML = '<div class="muted">所选节点已失效。</div>';
+    }
+  } else {
+    detail.innerHTML = '<div class="muted">点击方块查看详情；点击非叶子块下钻，顶部面包屑可回到上一层。<br/>hover 顶层方块查看跨模块依赖（橙色虚线）。</div>';
   }
 }
 

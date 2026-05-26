@@ -91,7 +91,8 @@ const server = http.createServer(async (req, res) => {
   try {
     if (pathname === '/api/health') return json(res, 200, { ok: true });
     if (pathname === '/api/gitnexus/health' && req.method === 'GET') {
-      const info = await gitnexus.isAvailable();
+      const force = reqUrl.searchParams.get('force') === '1';
+      const info = await gitnexus.isAvailable({ force });
       return json(res, 200, info);
     }
     if (pathname === '/api/policies') return json(res, 200, { policies: PRESET_POLICIES });
