@@ -17,6 +17,7 @@ import {
 } from './memoryEngine.js';
 import { decideToolApproval, decideAskUserQuestion } from './memoryDecider.js';
 import { relevantForPrompt } from './memoryRetriever.js';
+import { GoalRunner } from './goalRunner.js';
 
 let _id = 0;
 const nextId = () => `s${Date.now().toString(36)}${(_id++).toString(36)}`;
@@ -175,6 +176,7 @@ class Session {
     this.activeChild = null;
     this.activeTurn = null;
     this.pendingApprovals = new Map();
+    this.goalRunner = null;
   }
 
   summary() {
@@ -191,6 +193,7 @@ class Session {
       changeCount: this.changes.reduce((acc, c) => acc + c.files.length, 0),
       pendingApprovals: this.pendingApprovals.size,
       claudeSessionId: this.claudeSessionId,
+      goal: this.goalRunner ? this.goalRunner.summary() : null,
     };
   }
 
@@ -204,6 +207,18 @@ class Session {
   // 跳过 turn:start 里的 user 气泡，避免和 approval:resolved 的回答回显重复。
   async sendPrompt(prompt, opts = {}) {
     if (this.activeChild) throw new Error('当前会话已有运行中的对话');
+
+    // YOLO/Goal interception: when the user (not the GoalRunner itself) sends
+    // a prompt under the `yolo` policy, treat it as the task description and
+    // kick off the autonomous plan→dev→test→eval loop.
+    if (this.policyId === 'yolo' && !opts.fromGoal) {
+      if (this.goalRunner && this.goalRunner.status === 'active') {
+        throw new Error('YOLO 闭环正在运行，请先停止或等待结束');
+      }
+      this.goalRunner = new GoalRunner(this, { task: prompt });
+      return this.goalRunner.start();
+    }
+
     const policy = getPolicy(this.policyId);
     const turnId = `t${this.turns.length + 1}`;
     const turn = {
@@ -312,6 +327,9 @@ class Session {
   }
 
   cancel() {
+    if (this.goalRunner && this.goalRunner.status === 'active') {
+      this.goalRunner.abort('user-cancelled');
+    }
     if (!this.activeChild) return false;
     if (this._cancelRequested) return true; // idempotent
     this._cancelRequested = true;

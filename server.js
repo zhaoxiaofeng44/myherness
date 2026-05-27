@@ -20,6 +20,7 @@ import { distillExperiences } from './src/memoryDistiller.js';
 import { mergeHabit, mergeExperience, hashWorkdir } from './src/memoryEngine.js';
 import { relevantForPrompt } from './src/memoryRetriever.js';
 import { TerminalManager } from './src/terminalManager.js';
+import { GOAL_PROMPT_PATHS } from './src/goalRunner.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -96,6 +97,25 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, info);
     }
     if (pathname === '/api/policies') return json(res, 200, { policies: PRESET_POLICIES });
+
+    if (pathname === '/api/goal/info' && req.method === 'GET') {
+      const wd = parsed.query.workdir || '';
+      const projectPath = wd ? path.join(wd, GOAL_PROMPT_PATHS.projectRel) : null;
+      const readSafe = (p) => {
+        try {
+          if (p && fs.existsSync(p) && fs.statSync(p).isFile())
+            return fs.readFileSync(p, 'utf8');
+        } catch {}
+        return '';
+      };
+      return json(res, 200, {
+        globalPath: GOAL_PROMPT_PATHS.global,
+        projectPath,
+        globalContent: readSafe(GOAL_PROMPT_PATHS.global),
+        projectContent: readSafe(projectPath),
+      });
+    }
+
     if (pathname === '/api/sessions' && req.method === 'GET')
       return json(res, 200, { sessions: manager.list() });
     if (pathname === '/api/sessions' && req.method === 'POST') {

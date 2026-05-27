@@ -61,6 +61,16 @@ export const PRESET_POLICIES = {
       { match: 'tool:*', decision: 'auto', reason: '自动放行' },
     ],
   },
+  yolo: {
+    id: 'yolo',
+    name: 'YOLO 模式（自动闭环 Goal）',
+    description:
+      '选这条策略后，发送的第一条消息会被当成「目标」：自动生成 task.md / plan.md / test.md，按 plan 开发、跑测、自评，未达标自动回到开发，达标自动结束（最高权限，谨慎使用）',
+    permissionMode: 'bypassPermissions',
+    rules: [
+      { match: 'tool:*', decision: 'auto', reason: 'YOLO 模式自动放行' },
+    ],
+  },
   planOnly: {
     id: 'planOnly',
     name: '只计划',

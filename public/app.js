@@ -696,7 +696,17 @@ function renderTopbar() {
   }
   const s = state.detail.session;
   $('#sessionTitle').textContent = s.name;
-  $('#sessionMeta').textContent = `${s.workdir} · ${s.turnCount} 轮 · ${s.changeCount} 个变更文件`;
+  const metaParts = [s.workdir, `${s.turnCount} 轮`, `${s.changeCount} 个变更文件`];
+  if (s.goal) {
+    const g = s.goal;
+    const tag = g.active
+      ? `YOLO·${g.phaseLabel || g.phase}（第 ${g.iteration}/${g.maxIterations} 次）`
+      : `YOLO·${g.phaseLabel || g.phase}${g.reason ? '（' + g.reason + '）' : ''}`;
+    metaParts.push(tag);
+  } else if (s.policyId === 'yolo') {
+    metaParts.push('YOLO·待启动（发送任务即开始自动闭环）');
+  }
+  $('#sessionMeta').textContent = metaParts.join(' · ');
   $('#statusPill').textContent = labelFor(s.status);
   $('#statusPill').className = `status-pill ${s.status}`;
   // Stop button: enabled while a turn is in flight (including waiting on
@@ -801,6 +811,41 @@ function renderChatView() {
         text: `Claude session ${e.raw?.session_id || ''} 已初始化`,
         ts: e.ts,
       });
+    } else if (e.type === 'goal:start') {
+      items.push({
+        kind: 'system',
+        text: `YOLO 闭环启动 · 目标：${truncate(e.task || '', 160)}${e.guidanceLoaded ? ' · 已加载用户偏好' : ''}${e.cleanedArtefacts && e.cleanedArtefacts.length ? ' · 已清理：' + e.cleanedArtefacts.join('/') : ''}`,
+        ts: e.ts,
+      });
+    } else if (e.type === 'goal:phase') {
+      const label = { planning: '规划', developing: '开发', testing: '测试', evaluating: '评估' }[e.phase] || e.phase;
+      items.push({
+        kind: 'system',
+        text: `YOLO 进入「${label}」阶段（迭代 ${e.iteration || 0}）${e.reason ? ' · ' + e.reason : ''}`,
+        ts: e.ts,
+      });
+    } else if (e.type === 'goal:test-pass') {
+      items.push({ kind: 'system', text: 'YOLO 测试全部 PASS', ts: e.ts });
+    } else if (e.type === 'goal:test-fail') {
+      items.push({
+        kind: 'system',
+        text: 'YOLO 测试 FAIL：' + (Array.isArray(e.failures) ? e.failures.join('；') : '未知'),
+        ts: e.ts, error: true,
+      });
+    } else if (e.type === 'goal:eval-fail') {
+      items.push({
+        kind: 'system',
+        text: 'YOLO 评估未达成：' + (Array.isArray(e.gaps) ? e.gaps.join('；') : '未知'),
+        ts: e.ts, error: true,
+      });
+    } else if (e.type === 'goal:done') {
+      items.push({ kind: 'system', text: '✓ YOLO 目标达成，闭环结束' + (e.reason ? '（' + e.reason + '）' : ''), ts: e.ts });
+    } else if (e.type === 'goal:failed') {
+      items.push({ kind: 'system', text: '✗ YOLO 闭环停止：' + (e.reason || '未知'), ts: e.ts, error: true });
+    } else if (e.type === 'goal:aborted') {
+      items.push({ kind: 'system', text: 'YOLO 闭环已手动停止' + (e.reason ? '（' + e.reason + '）' : ''), ts: e.ts });
+    } else if (e.type === 'goal:warning') {
+      items.push({ kind: 'system', text: 'YOLO 提示：' + (e.message || ''), ts: e.ts });
     } else if (e.type === 'approval:resolved') {
       // AUQ 回答即时回显：避免提交后到下一轮 turn:start 之间留白，让用户
       // 立刻看到自己选了什么；非 AUQ 的审批不在聊天流里渲染（仍属审计）。
