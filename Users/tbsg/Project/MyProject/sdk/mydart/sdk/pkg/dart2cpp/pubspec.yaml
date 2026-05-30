@@ -1,0 +1,17 @@
+name: dart2cpp
+description: >-
+  Converter that rewrites dynamic Dart source into a stricter "static Dart"
+  dialect where every function value is expressed through the TypeFunction
+  hierarchy instead of the built-in Function type.
+publish_to: none
+version: 0.1.0
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  analyzer: ^13.0.0
+  path: ^1.9.0
+
+dev_dependencies:
+  test: ^1.25.0
