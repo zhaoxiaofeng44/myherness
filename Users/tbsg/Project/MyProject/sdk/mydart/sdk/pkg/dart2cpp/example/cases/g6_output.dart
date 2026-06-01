@@ -1,3 +1,4 @@
+import 'package:dart2cpp/restorer/runtime_classes.dart';
 import 'package:dart2cpp/runtime/type_function.dart';
 
 int twice(int x) => x * 2;
@@ -5,7 +6,7 @@ int twice(int x) => x * 2;
 void main() {
   final f = const _TearOff_twice();
   final g = const _TearOff_twice();
-  print(f(2) + g(3));
+  staticPrint(f(2) + g(3));
 }
 
 // --- dart2cpp synthesised TypeFunction subclasses ---

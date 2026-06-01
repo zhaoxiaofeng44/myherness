@@ -1,3 +1,4 @@
+import 'package:dart2cpp/restorer/runtime_classes.dart';
 import 'package:dart2cpp/runtime/type_function.dart';
 
 TypeFunction2<int, int, int> add = _Closure_1();
@@ -6,7 +7,7 @@ TypeFunction1<int, int> make(int seed) {
   return _Closure_2(seed);
 }
 
-var p = const _TearOff_print();
+var p = const _TearOff_staticPrint();
 
 void main() {
   add(2, 3);
@@ -30,8 +31,8 @@ class _Closure_2 extends TypeFunction1<int, int> {
   int call(int x) => x + seed;
 }
 
-class _TearOff_print extends TypeFunction1<void, Object?> {
-  const _TearOff_print();
+class _TearOff_staticPrint extends TypeFunction1<void, Object?> {
+  const _TearOff_staticPrint();
   @override
-  void call(Object? a1) => print(a1);
+  void call(Object? a1) => staticPrint(a1);
 }

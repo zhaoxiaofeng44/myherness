@@ -1,7 +1,11 @@
-# 验证清单（迭代 2）
+# 验证清单（迭代 2 + 迭代 3）
 
 每一条都能独立判定 PASS / FAIL。除非特别说明，命令都在 `pkg/dart2cpp/` 目录下执行。
-A/B/C/D/E/F 组是迭代 1 的红线（必须不回归）；G 组是这一轮新增。
+A/B/C/D/E/F 组是迭代 1 的红线（必须不回归）；G 组是迭代 2 新增（tear-off 全覆盖）；
+R 组是迭代 3 新增（业务零直连 dart:core，所有触点经 restorer）。
+
+迭代 3 引入了 Pass 7（rewrite_core_calls）与 `lib/restorer/runtime_classes.dart`，
+所以 G 组的 baseline 文本会变（语义不回归，文本回归红线放宽 — 见 G7）。
 
 ## A. 运行时模块自身
 
@@ -95,7 +99,36 @@ A/B/C/D/E/F 组是迭代 1 的红线（必须不回归）；G 组是这一轮新
   - PASS：输出里 `_TearOff_xxx` 的 `class` 定义**恰好一次**（`grep -c '^class _TearOff_'` == 期望值，对应该用例 1）。
   - FAIL：每出现一次就生成一个新类。
 
-- [ ] **G7 — 回归红线：迭代 1 全部样例仍通过**
-  - 命令：对 `example/cases/b1..e2`、`example/sample_input.dart` 逐个跑一次 `dart run bin/dart2cpp.dart …`，并对 `example/sample_input.dart` 做 `diff -u example/sample_output.dart /tmp/sample_actual.dart`。
-  - PASS：所有命令的退出码与迭代 1 评估时一致（错误用例非零、正确用例零、diff 为空）。
-  - FAIL：任意一项行为发生变化。
+- [ ] **G7 — 语义不回归（红线，文本可变）**
+  - 命令：对 `example/cases/b1..e2`、`example/sample_input.dart` 逐个跑一次 `dart run bin/dart2cpp.dart …`，正例 `dart analyze` 输出文件无 warning/error。
+  - PASS：所有命令的退出码与迭代 1 评估时一致（错误用例非零、正确用例零）；产物 `dart analyze` 干净；带 `print` 的输出能实跑（如 g3 输出 `15`）。
+  - 注意：迭代 3 后 sample_output.dart / g1..g6 输出会因为 staticPrint 和 StaticList 改写而有文本变化，diff 不再要求 byte-equal；用 `dart analyze` + 实跑代替。
+  - FAIL：任意一项行为发生语义变化（如 g3 输出 ≠ 15、g5 不再报错、c2 不再产出可编译代码）。
+
+## R. 业务零直连 dart:core（迭代 3 新增）
+
+- [ ] **R1 — 顶层 `print(...)` 调用被改写为 `staticPrint(...)`**
+  - 输入：`example/cases/r1_print_input.dart`，内容 `void main() { print('hi'); }`
+  - 命令：`dart run bin/dart2cpp.dart example/cases/r1_print_input.dart -o /tmp/r1.dart`
+  - PASS：输出含 `staticPrint('hi')`；无裸 `print(`；含 `import 'package:dart2cpp/restorer/runtime_classes.dart';`；`dart analyze /tmp/r1.dart` 干净。
+  - FAIL：保留裸 `print(`；或 restorer import 缺失。
+
+- [ ] **R2 — `[1,2,3]` List 字面量被改写为 `StaticList<int>.of3(1,2,3)`**
+  - 输入：`example/cases/r2_list_literal_input.dart`，内容 `void main() { var xs = [1,2,3]; print(xs[1]); }`
+  - PASS：输出含 `StaticList<int>.of3(1, 2, 3)`；无 `[1,` 之类裸字面量；`xs[1]` 仍合法（走 StaticList.[]）；产物 `dart analyze` 干净；实跑输出 `2`。
+  - FAIL：保留裸 List 字面量；或 `xs[1]` 编译失败。
+
+- [ ] **R3 — `[…].forEach(print)` 联动 + 参数位 tear-off 命中上下文类型**
+  - 输入：`example/cases/r3_foreach_input.dart`，内容 `void main() { [1,2,3].forEach(print); }`
+  - PASS：输出含 `StaticList<int>.of3(1, 2, 3).forEach(const _TearOff_staticPrint_void_int())`；生成类 `_TearOff_staticPrint_void_int extends TypeFunction1<void, int>`（**T = int 而非 Object?**，验证 D8 上下文类型驱动生效）；`dart analyze` 干净；实跑顺序输出 `1 / 2 / 3`。
+  - FAIL：tear-off 类型实参是 `Object?`（赋值给 `TypeFunction1<void, int>` 会编译错）；或 forEach 调用没改写到 StaticList。
+
+- [ ] **R4 — restorer 自身白名单成立**
+  - 命令：`dart analyze lib/restorer/runtime_classes.dart`
+  - PASS：无 error；文件内部出现 `List<T>` / `print(...)` 字样不被 Pass 6 拒绝。
+  - FAIL：分析报错。
+
+- [ ] **R5 — Pass 6 抓住业务侧裸 `print` / `List`**
+  - 手动制造：把 R1 的 staticPrint 文本替换为 print，重跑 Pass 6（或直接构造一个产物 `void main() { print('x'); }` 不走 Pass 7 路径）。
+  - PASS：Pass 6 报错指源位，错误信息含 `Forbidden 'print' identifier reference`。
+  - FAIL：放过。

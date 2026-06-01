@@ -1,7 +1,3 @@
-import 'dart:io';
-
-import 'package:analyzer/dart/analysis/analysis_context_collection.dart';
-import 'package:analyzer/dart/analysis/results.dart';
 import 'package:analyzer/dart/ast/ast.dart';
 import 'package:analyzer/dart/ast/visitor.dart';
 import 'package:analyzer/dart/element/element.dart';
@@ -9,36 +5,50 @@ import 'package:analyzer/dart/element/type.dart';
 import 'package:analyzer/source/line_info.dart';
 import 'package:path/path.dart' as p;
 
+import '../analysis/overlay_session.dart';
 import '../conversion_error.dart';
 import '../edits.dart';
 import 'rewrite_function_type.dart' show kMaxArity;
 
-/// Pass 4 (iteration 2) — resolved-AST-based rewrite that turns every
-/// function value in the source into a `TypeFunctionN<R, T...>` instance:
+const String _kTypeFunctionUri =
+    'package:dart2cpp/runtime/type_function.dart';
+const Set<String> _kTypeFunctionClassNames = {
+  'TypeFunction0',
+  'TypeFunction1',
+  'TypeFunction2',
+  'TypeFunction3',
+  'TypeFunction4',
+  'TypeFunction5',
+  'TypeFunction6',
+  'TypeFunction7',
+  'TypeFunction8',
+};
+
+/// Pass 4 (iteration 2 + D8 contextual typing) — resolved-AST-based rewrite
+/// that turns every function value in the source into a `TypeFunctionN<R,
+/// T...>` instance:
 ///   * closures / function literals → synthesised `_Closure_N`
 ///   * top-level / static / instance / constructor tear-offs → synthesised
-///     `_TearOff_<...>`, dedup by element identity
+///     `_TearOff_<...>`, dedup by element identity (and by contextual type
+///     when the call site pins one)
 ///   * generic tear-offs (the executable carries its own `<T>` formals) →
 ///     refuse with source position
 ///
 /// Must run **before** the syntactic function-type rewrite (Pass 3) so that
 /// inferred function types from the original `Function`-typed annotations are
 /// still available to read.
-Future<String> rewriteFunctionValues(String inputAbsPath) async {
-  final collection =
-      AnalysisContextCollection(includedPaths: [inputAbsPath]);
-  final ctx = collection.contextFor(inputAbsPath);
-  final result = await ctx.currentSession.getResolvedUnit(inputAbsPath);
-  if (result is! ResolvedUnitResult) {
-    throw ConversionError(
-      inputAbsPath, 1, 1,
-      'Could not resolve unit (${result.runtimeType}). dart2cpp Pass 4 needs '
-      'the input file to live inside a pub package so analyzer can resolve '
-      'its imports.',
-    );
-  }
-  final source = File(inputAbsPath).readAsStringSync();
-  final visitor = _Rewriter(inputAbsPath, source, result.lineInfo);
+///
+/// **Contextual typing (D8)**: when a tear-off appears as an argument whose
+/// `correspondingParameter.type` is a `TypeFunctionN<R, T1..Tn>` from our
+/// runtime, the generated wrapper is instantiated with those (R, T...) so
+/// it is type-assignable to the parameter slot. This is required because
+/// Dart's class type parameters are covariant — `TypeFunction1<void,
+/// Object?>` is NOT a subtype of `TypeFunction1<void, int>` even though
+/// `void Function(Object?)` IS a subtype of `void Function(int)`.
+Future<String> rewriteFunctionValues(OverlaySession session) async {
+  final result = await session.resolved();
+  final source = session.currentSource();
+  final visitor = _Rewriter(session.absPath, source, result.lineInfo);
   result.unit.visitChildren(visitor);
   final rewritten = applyEdits(source, visitor.edits);
   if (visitor.appended.isEmpty) return rewritten;
@@ -57,13 +67,16 @@ class _Rewriter extends RecursiveAstVisitor<void> {
   final List<SourceEdit> edits = [];
   final StringBuffer appended = StringBuffer();
 
-  /// element → generated class name (top-level / static / constructor)
+  /// element → generated class name (top-level / static / constructor, natural type)
   final Map<Element, String> _topLevelOrStaticByElement = {};
 
-  /// element → generated class name (instance methods are also dedup'd because
-  /// the class is parameterised over the receiver — each call site just
-  /// instantiates with its own receiver).
+  /// element → generated class name (instance methods, natural type)
   final Map<Element, String> _instanceMethodByElement = {};
+
+  /// Contextual-typed wrappers: keyed by `(element, contextual signature)`.
+  /// Same element used at two sites with different contextual types yields
+  /// two distinct classes.
+  final Map<String, String> _contextWrapsByKey = {};
 
   int _closureCounter = 0;
   final Set<String> _usedClassNames = {};
@@ -158,8 +171,6 @@ class _Rewriter extends RecursiveAstVisitor<void> {
     if (parent is MethodDeclaration && parent.name == node.token) return true;
     if (parent is ConstructorDeclaration) return true;
     if (parent is Label) return true;
-    // NamedArgument's name is a bare Token (not a SimpleIdentifier node) in
-    // analyzer 13, so it never matches `node` here.
     // Already-handled-by-parent positions.
     if (parent is PrefixedIdentifier) return true;
     if (parent is PropertyAccess && parent.propertyName == node) return true;
@@ -177,6 +188,28 @@ class _Rewriter extends RecursiveAstVisitor<void> {
   }
 
   // ---------------------------------------------------------------------------
+  // Contextual type detection (D8)
+  // ---------------------------------------------------------------------------
+
+  /// If [node]'s contextual type is a `TypeFunctionN<R, T...>` from our
+  /// runtime, return its (returnType, paramTypes). Otherwise null.
+  ({DartType returnType, List<DartType> paramTypes})? _contextTypeArgs(
+      Expression node) {
+    final param = node.correspondingParameter;
+    if (param == null) return null;
+    final t = param.type;
+    if (t is! InterfaceType) return null;
+    final el = t.element;
+    if (el is! ClassElement) return null;
+    final name = el.name;
+    if (name == null || !_kTypeFunctionClassNames.contains(name)) return null;
+    if (el.library.uri.toString() != _kTypeFunctionUri) return null;
+    final args = t.typeArguments;
+    if (args.isEmpty) return null;
+    return (returnType: args.first, paramTypes: args.skip(1).toList());
+  }
+
+  // ---------------------------------------------------------------------------
   // Tear-off wrapping
   // ---------------------------------------------------------------------------
 
@@ -187,12 +220,9 @@ class _Rewriter extends RecursiveAstVisitor<void> {
     required String? receiverSource,
     DartType? receiverType,
   }) {
-    // Skip if the element name already starts with TypeFunction — defensive.
     final eName = element.name ?? '';
     if (eName.startsWith('TypeFunction')) return;
 
-    // Generic tear-off: type still carries its own formals — we cannot pick
-    // concrete type arguments here, so refuse with source position.
     if (type.typeParameters.isNotEmpty) {
       _error(
         node.offset,
@@ -212,19 +242,60 @@ class _Rewriter extends RecursiveAstVisitor<void> {
       );
     }
 
+    final ctx = _contextTypeArgs(node);
     final isInstance = receiverSource != null;
-    final dedup = isInstance ? _instanceMethodByElement : _topLevelOrStaticByElement;
-    var className = dedup[element];
-    if (className == null) {
-      className = _generateClassName(element, isInstance: isInstance);
-      dedup[element] = className;
-      _emitTearOffClass(
-        className: className,
-        element: element,
-        type: type,
-        isInstance: isInstance,
-        receiverTypeText: isInstance ? _typeText(receiverType!) : null,
+    final useReturnType =
+        ctx?.returnType ?? type.returnType;
+    final useParamTypes = ctx?.paramTypes ??
+        [for (final fp in type.formalParameters) fp.type];
+
+    if (ctx != null && useParamTypes.length != type.formalParameters.length) {
+      _error(
+        node.offset,
+        'Contextual TypeFunction arity ${useParamTypes.length} does not '
+        'match tear-off arity ${type.formalParameters.length}.',
       );
+    }
+
+    final String className;
+    if (ctx != null) {
+      // Contextual key: scope by element identity + contextual signature.
+      final sig = _typeSignature(useReturnType, useParamTypes);
+      final key = '${identityHashCode(element)}|$sig';
+      final existing = _contextWrapsByKey[key];
+      if (existing != null) {
+        className = existing;
+      } else {
+        className =
+            _generateClassName(element, isInstance: isInstance, suffix: sig);
+        _contextWrapsByKey[key] = className;
+        _emitTearOffClass(
+          className: className,
+          element: element,
+          returnType: useReturnType,
+          paramTypes: useParamTypes,
+          isInstance: isInstance,
+          receiverTypeText: isInstance ? _typeText(receiverType!) : null,
+        );
+      }
+    } else {
+      final dedup = isInstance
+          ? _instanceMethodByElement
+          : _topLevelOrStaticByElement;
+      var name = dedup[element];
+      if (name == null) {
+        name = _generateClassName(element, isInstance: isInstance, suffix: null);
+        dedup[element] = name;
+        _emitTearOffClass(
+          className: name,
+          element: element,
+          returnType: useReturnType,
+          paramTypes: useParamTypes,
+          isInstance: isInstance,
+          receiverTypeText: isInstance ? _typeText(receiverType!) : null,
+        );
+      }
+      className = name;
     }
 
     final replacement = isInstance
@@ -233,8 +304,23 @@ class _Rewriter extends RecursiveAstVisitor<void> {
     edits.add(SourceEdit(node.offset, node.length, replacement));
   }
 
+  String _typeSignature(DartType ret, List<DartType> params) {
+    final all = [_typeText(ret), for (final p in params) _typeText(p)];
+    return all.map(_sanitizeForName).join('_');
+  }
+
+  String _sanitizeForName(String s) {
+    return s
+        .replaceAll('?', '_q')
+        .replaceAll('<', '_')
+        .replaceAll('>', '')
+        .replaceAll(',', '_')
+        .replaceAll(' ', '')
+        .replaceAll('.', '_');
+  }
+
   String _generateClassName(ExecutableElement element,
-      {required bool isInstance}) {
+      {required bool isInstance, required String? suffix}) {
     final name = element.name ?? 'anon';
     final enclosing = element.enclosingElement;
     String base;
@@ -249,6 +335,9 @@ class _Rewriter extends RecursiveAstVisitor<void> {
     } else {
       base = '_TearOff_$name';
     }
+    if (suffix != null && suffix.isNotEmpty) {
+      base = '${base}_$suffix';
+    }
     var candidate = base;
     var i = 2;
     while (_usedClassNames.contains(candidate)) {
@@ -262,18 +351,16 @@ class _Rewriter extends RecursiveAstVisitor<void> {
   void _emitTearOffClass({
     required String className,
     required ExecutableElement element,
-    required FunctionType type,
+    required DartType returnType,
+    required List<DartType> paramTypes,
     required bool isInstance,
     required String? receiverTypeText,
   }) {
-    final params = type.formalParameters;
-    final arity = params.length;
-    final returnText = _typeText(type.returnType);
-    final paramTexts = [
-      for (final p in params) _typeText(p.type),
-    ];
+    final arity = paramTypes.length;
+    final returnText = _typeText(returnType);
+    final paramTexts = [for (final t in paramTypes) _typeText(t)];
     final paramNames = [
-      for (var i = 0; i < params.length; i++) 'a${i + 1}',
+      for (var i = 0; i < arity; i++) 'a${i + 1}',
     ];
     final typeArgs = [returnText, ...paramTexts].join(', ');
     final callParams = [
@@ -396,10 +483,6 @@ class _Rewriter extends RecursiveAstVisitor<void> {
   }
 
   List<_Captured> _captureLocals(FunctionExpression closure) {
-    // Walk the closure body and pick out element references that resolve to
-    // locals / parameters declared OUTSIDE the closure but INSIDE the
-    // enclosing function. Use element identity so we don't accidentally
-    // capture top-level / imported things.
     final boundary = _enclosingFunctionBody(closure);
     if (boundary == null) return const [];
     final ownParams = <Element>{};
@@ -442,12 +525,9 @@ class _Rewriter extends RecursiveAstVisitor<void> {
   }
 
   bool _isInsideBoundary(Element el, AstNode boundary) {
-    // Walk up the element's enclosing chain — if we hit a function/method
-    // whose AST is `boundary`, the local is in scope.
     Element? cur = el.enclosingElement;
     while (cur != null) {
       if (cur is ExecutableElement) {
-        // Compare by name + offset against the boundary's declaration.
         if (boundary is FunctionDeclaration &&
             boundary.name.lexeme == cur.name) {
           return true;
@@ -516,8 +596,6 @@ class _UsedElementCollector extends RecursiveAstVisitor<void> {
     if (parent is PropertyAccess && parent.propertyName == node) return;
     if (parent is PrefixedIdentifier && parent.identifier == node) return;
     if (parent is Label) return;
-    // NamedArgument.name is a Token in analyzer 13 — no SimpleIdentifier
-    // child to skip here.
     if (parent is MethodInvocation &&
         parent.methodName == node &&
         parent.target != null) return;

@@ -1,3 +1,4 @@
+import 'package:dart2cpp/restorer/runtime_classes.dart';
 import 'package:dart2cpp/runtime/type_function.dart';
 
 class Counter {
@@ -9,7 +10,7 @@ class Counter {
 void main() {
   final c = Counter(10);
   final h = _TearOff_Counter_handle(c);
-  print(h(5));
+  staticPrint(h(5));
 }
 
 // --- dart2cpp synthesised TypeFunction subclasses ---
