@@ -46,6 +46,7 @@ const state = {
   suggestDebounce: null,
   expandedHeads: new Set(), // chain heads whose history list is expanded
   pendingPromptDraft: null, // { sessionId, text } — applied once active session matches
+  approvalRenderSig: null,  // signature of last-rendered approval pane (id:deciderState|...)
 };
 
 // ===== Utility =====
@@ -530,6 +531,7 @@ async function selectSession(id) {
   state.gitNexusHierarchyRoot = [];
   state.gitNexusHierarchySelected = null;
   state.gitNexusHierarchyHover = null;
+  state.approvalRenderSig = null;
   await loadDetail();
   renderSessionList();
   renderAll();
@@ -669,6 +671,7 @@ function renderViewIfActive() {
     if (!state.memory) loadMemory();
     else renderMemoryView();
   }
+  else if (state.view === 'scad') renderScadView();
 }
 
 function switchStructureTab(tab) {
@@ -876,32 +879,114 @@ function renderChatView() {
     '<div class="empty">输入下方框开始你的第一轮对话</div>';
   if (wasAtBottom) pane.scrollTop = pane.scrollHeight;
 
-  $$('.approve-btn', pane).forEach((b) =>
-    b.addEventListener('click', () => resolveApproval(b.dataset.id, b.dataset.action)),
-  );
-
   // Approval panel
   // 每个后端事件都会触发 renderChatView，所以这里每次都会重写 approval pane
   // 的 innerHTML —— 不做防护的话，用户正在 AUQ 卡片里选的 .selected chip
   // 和已填的 textarea 会被瞬间清空，体感是「我刚选完就被覆盖了」。
-  // 渲染前 snapshot 选中 / 文本，渲染后恢复，避免破坏用户正在进行的输入。
-  const approvals = state.detail.pendingApprovals || [];
-  const approvalSnap = snapshotApprovalPaneState();
+  // 这里改为「签名匹配 + 局部更新」：
+  //   ① 卡片 id 集合没变 → 不动 DOM，只在 decider 状态变化时改 decider bar；
+  //      textarea 的 value / 焦点 / 光标位置完全不受影响。
+  //   ② 卡片 id 集合变了 → 仍用 snapshot + 全量重写，并把焦点 / 光标还原。
+  renderApprovalPane();
+  insertDepositButtons();
+}
+
+function renderApprovalPane() {
+  const pane = $('#approvalPane');
+  if (!pane) return;
+  const approvals = (state.detail && state.detail.pendingApprovals) || [];
+  const newSig = approvalSignature(approvals);
+  const oldSig = state.approvalRenderSig;
+
   if (approvals.length === 0) {
-    $('#approvalPane').innerHTML = '';
-  } else {
-    $('#approvalPane').innerHTML = approvals.map(renderApprovalCard).join('');
-    wireApprovalCards();
-    restoreApprovalPaneState(approvalSnap);
+    if (pane.innerHTML !== '') pane.innerHTML = '';
+    state.approvalRenderSig = '';
+    return;
   }
 
-  insertDepositButtons();
+  if (sameApprovalIdSet(oldSig, newSig)) {
+    updateDeciderBars(approvals);
+    state.approvalRenderSig = newSig;
+    return;
+  }
+
+  const snap = snapshotApprovalPaneState();
+  pane.innerHTML = renderApprovalShell(approvals);
+  wireApprovalShell();
+  restoreApprovalPaneState(snap);
+  state.approvalRenderSig = newSig;
+}
+
+function approvalSignature(approvals) {
+  return approvals.map((a) => `${a.id}:${a.deciderState || ''}`).join('|');
+}
+function sameApprovalIdSet(oldSig, newSig) {
+  if (oldSig == null) return false;
+  const ids = (sig) => (sig || '').split('|').map((s) => s.split(':')[0]).join(',');
+  return ids(oldSig) === ids(newSig);
+}
+
+// Surgical update when the same approvals are still pending but their decider
+// state changed (memory:deciding → memory:decision-uncertain). 不重写整个 pane，
+// 只换 decider-bar 槽位 —— 这样 textarea 焦点 / 光标 / 在敲的内容都不会被打断。
+function updateDeciderBars(approvals) {
+  const pane = $('#approvalPane');
+  if (!pane) return;
+  for (const a of approvals) {
+    const card = pane.querySelector(`.approval-card[data-id="${a.id}"]`);
+    if (!card) continue;
+    card.classList.toggle('approval-decider-pending', a.deciderState === 'pending');
+    card.classList.toggle('approval-decider-uncertain', a.deciderState === 'uncertain');
+    const slot = card.querySelector('.approval-decider-bar-slot');
+    if (slot) slot.innerHTML = renderDeciderBar(a);
+  }
+  $$('.cancel-decider-btn', pane).forEach((btn) => {
+    btn.onclick = () => cancelDecider(btn.dataset.id);
+  });
+}
+
+// Single shell containing all pending approvals + one bottom submit button.
+// 用户的原话：「最终只需要一个最终的提交按钮」——所以每张卡片不再有独立的
+// 「通过 / 拒绝 / 提交回答并继续」，而是把决定收敛成一行 chip，由壳层统一提交。
+function renderApprovalShell(approvals) {
+  const cards = approvals.map(renderApprovalCard).join('');
+  return `
+    <div class="approval-shell">
+      <div class="approval-shell-head">
+        <span class="approval-shell-title">⏸ 等你回答 · 共 ${approvals.length} 项</span>
+        <span class="muted">逐项作答后点击下方「提交全部」一次性发送</span>
+      </div>
+      <div class="approval-shell-body">${cards}</div>
+      <div class="approval-shell-footer">
+        <button type="button" class="primary-btn approval-submit-all">提交全部</button>
+        <button type="button" class="ghost-btn approval-reject-all">全部拒绝</button>
+      </div>
+    </div>`;
 }
 
 function snapshotApprovalPaneState() {
   const pane = $('#approvalPane');
   if (!pane) return null;
-  const snap = {};
+  const snap = { cards: {}, focus: null };
+  const active = document.activeElement;
+  if (active && pane.contains(active)) {
+    const card = active.closest('.approval-card');
+    if (card?.dataset.id && active.tagName === 'TEXTAREA') {
+      let kind = null;
+      let key = null;
+      if (active.dataset.note) { kind = 'note'; key = active.dataset.note; }
+      else if (active.dataset.qi != null) { kind = 'qi'; key = active.dataset.qi; }
+      if (kind) {
+        snap.focus = {
+          cardId: card.dataset.id,
+          kind,
+          key,
+          selStart: active.selectionStart,
+          selEnd: active.selectionEnd,
+        };
+      }
+    }
+  }
   pane.querySelectorAll('.approval-card').forEach((card) => {
     const id = card.dataset.id;
     if (!id) return;
@@ -909,6 +994,7 @@ function snapshotApprovalPaneState() {
     card.querySelectorAll('.auq-option.selected').forEach((b) => {
       selections.push({ qi: b.dataset.q, opt: b.dataset.opt });
     });
+    const decision = card.querySelector('.approval-decision-chip.selected')?.dataset.decision || null;
     const texts = {};
     card.querySelectorAll('textarea').forEach((t) => {
       let key = '';
@@ -916,7 +1002,7 @@ function snapshotApprovalPaneState() {
       else if (t.dataset.qi != null) key = 'qi:' + t.dataset.qi;
       if (key) texts[key] = t.value;
     });
-    snap[id] = { selections, texts };
+    snap.cards[id] = { selections, decision, texts };
   });
   return snap;
 }
@@ -925,14 +1011,19 @@ function restoreApprovalPaneState(snap) {
   if (!snap) return;
   const pane = $('#approvalPane');
   if (!pane) return;
-  for (const id in snap) {
+  for (const id in snap.cards) {
     const card = pane.querySelector(`.approval-card[data-id="${id}"]`);
     if (!card) continue;
-    for (const { qi, opt } of snap[id].selections) {
+    const s = snap.cards[id];
+    for (const { qi, opt } of s.selections) {
       const btn = card.querySelector(`.auq-option[data-q="${qi}"][data-opt="${opt}"]`);
       if (btn) btn.classList.add('selected');
     }
-    for (const key in snap[id].texts) {
+    if (s.decision) {
+      const dec = card.querySelector(`.approval-decision-chip[data-decision="${s.decision}"]`);
+      if (dec) dec.classList.add('selected');
+    }
+    for (const key in s.texts) {
       const sepIdx = key.indexOf(':');
       const kind = key.slice(0, sepIdx);
       const k = key.slice(sepIdx + 1);
@@ -940,7 +1031,19 @@ function restoreApprovalPaneState(snap) {
         ? `textarea[data-note="${k}"]`
         : `textarea[data-qi="${k}"]`;
       const t = card.querySelector(sel);
-      if (t) t.value = snap[id].texts[key];
+      if (t) t.value = s.texts[key];
+    }
+  }
+  if (snap.focus) {
+    const { cardId, kind, key, selStart, selEnd } = snap.focus;
+    const card = pane.querySelector(`.approval-card[data-id="${cardId}"]`);
+    const sel = kind === 'note'
+      ? `textarea[data-note="${key}"]`
+      : `textarea[data-qi="${key}"]`;
+    const el = card?.querySelector(sel);
+    if (el) {
+      el.focus();
+      try { el.setSelectionRange(selStart, selEnd); } catch {}
     }
   }
 }
@@ -954,19 +1057,24 @@ function renderApprovalCard(a) {
   const cls = ['approval-card'];
   if (a.deciderState === 'pending') cls.push('approval-decider-pending');
   if (a.deciderState === 'uncertain') cls.push('approval-decider-uncertain');
+  // 「授权也可以看成一种特殊的选择」：用与 AUQ 一致的 chip 风格让用户选
+  // 「通过 / 拒绝」，提交统一交给壳层底部的「提交全部」。
   return `
-    <div class="${cls.join(' ')}" data-id="${a.id}">
+    <div class="${cls.join(' ')}" data-id="${a.id}" data-kind="tool">
       <div class="approval-title">⚠ 等待人工授权 · 工具：${escapeHtml(a.tool)}</div>
       <div class="muted">${escapeHtml(a.reason || '')}</div>
-      ${renderDeciderBar(a)}
+      <div class="approval-decider-bar-slot">${renderDeciderBar(a)}</div>
       ${renderMemoryHint(a)}
       <div class="approval-input">${escapeHtml(JSON.stringify(a.input, null, 2))}</div>
+      <div class="approval-decision">
+        <span class="approval-decision-label">你的决定</span>
+        <div class="approval-decision-chips" data-decision-for="${a.id}">
+          <button type="button" class="approval-decision-chip" data-decision="approve" data-id="${a.id}">通过</button>
+          <button type="button" class="approval-decision-chip reject" data-decision="reject" data-id="${a.id}">拒绝</button>
+        </div>
+      </div>
       <textarea class="approval-note" data-note="${a.id}"
         placeholder="（可选）写下要附带的备注，会随本次决定一起记录…" rows="2"></textarea>
-      <div class="approval-actions">
-        <button class="primary-btn approve-btn" data-id="${a.id}" data-action="approve">通过</button>
-        <button class="ghost-btn approve-btn" data-id="${a.id}" data-action="reject">拒绝</button>
-      </div>
     </div>`;
 }
 
@@ -1032,40 +1140,27 @@ function renderAskUserQuestionCard(a) {
   if (a.deciderState === 'pending') cls.push('approval-decider-pending');
   if (a.deciderState === 'uncertain') cls.push('approval-decider-uncertain');
   return `
-    <div class="${cls.join(' ')}" data-id="${a.id}">
+    <div class="${cls.join(' ')}" data-id="${a.id}" data-kind="auq">
       <div class="approval-title">？ Claude 在等你回答 · AskUserQuestion</div>
-      <div class="muted">回答会写入提交记录，并自动填充到下方输入框，按发送即作为下一轮的提示发送给 Claude。</div>
-      ${renderDeciderBar(a)}
+      <div class="muted">逐题选择或自由输入；与其他待办合并后，点击下方「提交全部」一次性发送给 Claude。</div>
+      <div class="approval-decider-bar-slot">${renderDeciderBar(a)}</div>
       ${renderMemoryHint(a)}
       <div class="auq-questions">${blocks || '<div class="muted">（没有结构化问题，可在备注里直接回答）</div>'}</div>
       <textarea class="approval-note" data-note="${a.id}"
         placeholder="（可选）总体备注…" rows="2"></textarea>
-      <div class="approval-actions">
-        <button class="primary-btn auq-submit" data-id="${a.id}">提交回答并继续</button>
-        <button class="ghost-btn approve-btn" data-id="${a.id}" data-action="reject">取消</button>
-      </div>
     </div>`;
 }
 
-function wireApprovalCards() {
-  // Plain approve/reject (non-AskUserQuestion + the 取消 button on AUQ).
-  $$('.approve-btn', $('#approvalPane')).forEach((b) =>
-    b.addEventListener('click', () => {
-      const note = readApprovalNote(b.dataset.id);
-      resolveApproval(b.dataset.id, b.dataset.action, note);
-    }),
-  );
+function wireApprovalShell() {
+  const pane = $('#approvalPane');
+  if (!pane) return;
 
   // AskUserQuestion: option chip toggles selection (single or multi).
-  $$('.auq-option', $('#approvalPane')).forEach((btn) => {
+  $$('.auq-option', pane).forEach((btn) => {
     btn.addEventListener('click', () => {
       const qi = btn.dataset.q;
       const card = btn.closest('.auq-card');
-      // 用户开始动手作答时，立刻取消同卡片仍在飞行中的后台 decider，避免
-      // decider 在用户点完选项、还没点提交前就抢先 resolveApproval 触发下一轮。
-      if (card?.classList.contains('approval-decider-pending') && card.dataset.id) {
-        cancelDecider(card.dataset.id);
-      }
+      cancelDeciderIfPending(card);
       const questionEl = card.querySelector(`.auq-question[data-qi="${qi}"]`);
       const multi = questionEl.querySelector('.auq-multi') != null;
       if (!multi) {
@@ -1075,18 +1170,27 @@ function wireApprovalCards() {
     });
   });
 
-  // AskUserQuestion: submit aggregates per-question answers and resolves the
-  // approval. The backend resumes Claude with the answer immediately, so we
-  // do NOT also paste it into the prompt textarea (would imply a second send).
-  $$('.auq-submit', $('#approvalPane')).forEach((btn) => {
-    btn.addEventListener('click', () => submitAskUserQuestion(btn.dataset.id));
+  // Plain tool decision chips ——「授权」也是一种 chip 选择，互斥单选。
+  $$('.approval-decision-chip', pane).forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const card = btn.closest('.approval-card');
+      cancelDeciderIfPending(card);
+      card.querySelectorAll('.approval-decision-chip').forEach((b) => b.classList.remove('selected'));
+      btn.classList.add('selected');
+    });
   });
 
-  $$('.cancel-decider-btn', $('#approvalPane')).forEach((btn) => {
+  // One submit button for the whole shell.
+  const submitBtn = pane.querySelector('.approval-submit-all');
+  if (submitBtn) submitBtn.addEventListener('click', submitAllApprovals);
+  const rejectBtn = pane.querySelector('.approval-reject-all');
+  if (rejectBtn) rejectBtn.addEventListener('click', rejectAllApprovals);
+
+  $$('.cancel-decider-btn', pane).forEach((btn) => {
     btn.addEventListener('click', () => cancelDecider(btn.dataset.id));
   });
 
-  $$('a[data-mem-link]', $('#approvalPane')).forEach((a) => {
+  $$('a[data-mem-link]', pane).forEach((a) => {
     a.addEventListener('click', (e) => {
       e.preventDefault();
       switchView('memory');
@@ -1094,16 +1198,24 @@ function wireApprovalCards() {
   });
 }
 
+// 用户开始动手作答时，立刻取消同卡片仍在飞行中的后台 decider，避免 decider
+// 在用户点完选项还没点提交前就抢先 resolveApproval 触发下一轮。
+function cancelDeciderIfPending(card) {
+  if (card?.classList.contains('approval-decider-pending') && card.dataset.id) {
+    cancelDecider(card.dataset.id);
+  }
+}
+
 function readApprovalNote(id) {
   const t = $(`.approval-note[data-note="${id}"]`, $('#approvalPane'));
   return t ? t.value.trim() : '';
 }
 
-function submitAskUserQuestion(id) {
-  const card = $(`.approval-card[data-id="${id}"]`, $('#approvalPane'));
-  if (!card) return;
+// Collect this card's AUQ answers. Returns {complete, note, auqAnswers}.
+function collectAuqCardAnswer(card) {
   const lines = [];
   const auqAnswers = [];
+  let hasAny = false;
   card.querySelectorAll('.auq-question').forEach((qEl) => {
     const head = qEl.querySelector('.auq-q-text')?.textContent?.trim() || '';
     const picked = Array.from(qEl.querySelectorAll('.auq-option.selected'))
@@ -1113,14 +1225,82 @@ function submitAskUserQuestion(id) {
     const parts = [];
     if (picked.length) parts.push(picked.join(' / '));
     if (custom) parts.push(custom);
-    if (parts.length) lines.push(`• ${head}\n  → ${parts.join(' | ')}`);
+    if (parts.length) {
+      lines.push(`• ${head}\n  → ${parts.join(' | ')}`);
+      hasAny = true;
+    }
     if (picked.length) auqAnswers.push({ question: head, picked });
   });
-  const noteText = readApprovalNote(id);
-  if (noteText) lines.push(`备注：${noteText}`);
-  const answer = lines.join('\n');
+  const noteText = readApprovalNote(card.dataset.id);
+  if (noteText) {
+    lines.push(`备注：${noteText}`);
+    hasAny = true;
+  }
+  return {
+    complete: hasAny,
+    note: lines.join('\n'),
+    auqAnswers,
+  };
+}
 
-  resolveApproval(id, 'approve', answer, auqAnswers);
+function collectToolCardAnswer(card) {
+  const decision = card.querySelector('.approval-decision-chip.selected')?.dataset.decision || '';
+  return {
+    complete: decision === 'approve' || decision === 'reject',
+    decision,
+    note: readApprovalNote(card.dataset.id),
+  };
+}
+
+// 「在全部选择完成之前，不能触发当前进度继续」：先校验每张卡片都已作答，
+// 任意一张未作答就高亮提示并直接返回，不发任何请求；全部就绪后再统一提交。
+function submitAllApprovals() {
+  const pane = $('#approvalPane');
+  if (!pane) return;
+  const approvals = (state.detail && state.detail.pendingApprovals) || [];
+  if (approvals.length === 0) return;
+
+  // Validation pass — fail fast before any network call.
+  const plans = [];
+  for (const a of approvals) {
+    const card = pane.querySelector(`.approval-card[data-id="${a.id}"]`);
+    if (!card) continue;
+    card.classList.remove('approval-card-missing');
+    if (a.tool === 'AskUserQuestion') {
+      const r = collectAuqCardAnswer(card);
+      if (!r.complete) {
+        card.classList.add('approval-card-missing');
+        card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        alert(`「${a.tool}」尚未作答：请至少选择一个选项或填写回答 / 备注`);
+        return;
+      }
+      plans.push({ id: a.id, action: 'approve', note: r.note, auqAnswers: r.auqAnswers });
+    } else {
+      const r = collectToolCardAnswer(card);
+      if (!r.complete) {
+        card.classList.add('approval-card-missing');
+        card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        alert(`「${a.tool}」尚未作答：请先选择「通过」或「拒绝」`);
+        return;
+      }
+      plans.push({ id: a.id, action: r.decision, note: r.note, auqAnswers: null });
+    }
+  }
+
+  // All clear — fire resolveApproval for each. They run independently; the
+  // backend uses each toolUseId so order across the wire doesn't matter.
+  for (const p of plans) {
+    resolveApproval(p.id, p.action, p.note, p.auqAnswers);
+  }
+}
+
+function rejectAllApprovals() {
+  const approvals = ((state.detail && state.detail.pendingApprovals) || []).slice();
+  if (approvals.length === 0) return;
+  if (!confirm(`确认对全部 ${approvals.length} 项作答为「拒绝/取消」？`)) return;
+  for (const a of approvals) {
+    resolveApproval(a.id, 'reject', '', null);
+  }
 }
 
 function renderChatItem(it) {
@@ -3484,6 +3664,227 @@ function renderTerminal() {
   const workdir = state.detail?.session?.workdir || '(未选择会话)';
   if (cwdEl) cwdEl.textContent = workdir;
   attachTerminalToActiveSession();
+}
+
+// ===== OpenSCAD editor + 3D preview =====
+//
+// Editor: plain textarea (project convention — no CodeMirror).
+// Renderer: backend spawns local `openscad` CLI → STL bytes.
+// Viewer: Three.js (CDN) + STLLoader + OrbitControls.
+// Code persists to localStorage so a refresh doesn't blow away work.
+
+const SCAD_LS_KEY = 'cc:scad:source';
+const SCAD_DEFAULT = `// 一个简单示例：圆角立方体减去一个球
+difference() {
+  minkowski() {
+    cube([20, 20, 20], center = true);
+    sphere(r = 2, $fn = 24);
+  }
+  translate([0, 0, 0]) sphere(r = 12, $fn = 48);
+}
+`;
+
+const scadState = {
+  inited: false,
+  health: null, // { ok, reason }
+  viewer: null, // { scene, camera, renderer, controls, mesh, raf, ro }
+};
+
+async function renderScadView() {
+  if (!scadState.inited) {
+    scadState.inited = true;
+    const ta = $('#scadEditor');
+    const saved = localStorage.getItem(SCAD_LS_KEY);
+    ta.value = saved && saved.trim() ? saved : SCAD_DEFAULT;
+    ta.addEventListener('input', () => localStorage.setItem(SCAD_LS_KEY, ta.value));
+    ta.addEventListener('keydown', (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault();
+        runScadRender();
+      }
+    });
+    $('#scadRenderBtn').addEventListener('click', runScadRender);
+    $('#scadResetBtn').addEventListener('click', () => {
+      ta.value = SCAD_DEFAULT;
+      localStorage.setItem(SCAD_LS_KEY, SCAD_DEFAULT);
+    });
+    probeScadHealth();
+  }
+  ensureScadViewer();
+}
+
+async function probeScadHealth() {
+  const pill = $('#scadHealthPill');
+  pill.textContent = '检测中…';
+  pill.className = 'status-pill';
+  try {
+    const info = await api('/api/scad/health');
+    scadState.health = info;
+    if (info.ok) {
+      pill.textContent = '已就绪';
+      pill.className = 'status-pill idle';
+      pill.title = info.version || '';
+    } else {
+      pill.textContent = '未安装';
+      pill.className = 'status-pill error';
+      pill.title = info.reason || '';
+    }
+  } catch (e) {
+    scadState.health = { ok: false, reason: e.message };
+    pill.textContent = '未安装';
+    pill.className = 'status-pill error';
+    pill.title = e.message;
+  }
+}
+
+async function runScadRender() {
+  const src = $('#scadEditor').value;
+  if (!src.trim()) return;
+  const status = $('#scadStatus');
+  const log = $('#scadLog');
+  const btn = $('#scadRenderBtn');
+  btn.disabled = true;
+  status.textContent = '渲染中…';
+  log.classList.add('hidden');
+  try {
+    const resp = await fetch('/api/scad/render', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: src }),
+    });
+    const ctype = resp.headers.get('content-type') || '';
+    if (!resp.ok || ctype.includes('application/json')) {
+      const body = await resp.json().catch(() => ({}));
+      status.textContent = '✗ ' + (body.error || resp.statusText);
+      if (body.log) {
+        log.textContent = body.log;
+        log.classList.remove('hidden');
+      }
+      return;
+    }
+    const buf = await resp.arrayBuffer();
+    const serverLog = decodeURIComponent(resp.headers.get('X-Scad-Log') || '');
+    loadStlIntoViewer(buf);
+    status.textContent = `✓ ${(buf.byteLength / 1024).toFixed(1)} KB STL`;
+    if (serverLog.trim()) {
+      log.textContent = serverLog;
+      log.classList.remove('hidden');
+    }
+  } catch (e) {
+    status.textContent = '✗ ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function ensureScadViewer() {
+  if (scadState.viewer) {
+    // Re-trigger sizing in case the view just became visible.
+    setTimeout(() => resizeScadViewer(), 30);
+    return scadState.viewer;
+  }
+  if (typeof THREE === 'undefined') {
+    $('#scadViewer').innerHTML =
+      '<div class="empty">Three.js 加载失败，请检查网络。</div>';
+    return null;
+  }
+  const host = $('#scadViewer');
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x14181f);
+
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 5000);
+  camera.position.set(60, 60, 60);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(window.devicePixelRatio || 1);
+  host.innerHTML = '';
+  host.appendChild(renderer.domElement);
+
+  const amb = new THREE.AmbientLight(0xffffff, 0.55);
+  const dir1 = new THREE.DirectionalLight(0xffffff, 0.7);
+  dir1.position.set(80, 120, 100);
+  const dir2 = new THREE.DirectionalLight(0xffffff, 0.35);
+  dir2.position.set(-90, -40, 60);
+  scene.add(amb, dir1, dir2);
+
+  const grid = new THREE.GridHelper(200, 20, 0x2a3140, 0x222732);
+  grid.rotation.x = Math.PI / 2;
+  scene.add(grid);
+
+  const axes = new THREE.AxesHelper(40);
+  scene.add(axes);
+
+  const Controls = THREE.OrbitControls;
+  const controls = Controls ? new Controls(camera, renderer.domElement) : null;
+  if (controls) {
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+  }
+
+  const v = { scene, camera, renderer, controls, mesh: null, raf: 0, ro: null };
+  const tick = () => {
+    v.raf = requestAnimationFrame(tick);
+    controls?.update();
+    renderer.render(scene, camera);
+  };
+  tick();
+
+  const ro = new ResizeObserver(() => resizeScadViewer());
+  ro.observe(host);
+  v.ro = ro;
+
+  scadState.viewer = v;
+  setTimeout(() => resizeScadViewer(), 0);
+  return v;
+}
+
+function resizeScadViewer() {
+  const v = scadState.viewer;
+  if (!v) return;
+  const host = $('#scadViewer');
+  const w = host.clientWidth || 600;
+  const h = host.clientHeight || 400;
+  v.renderer.setSize(w, h, false);
+  v.camera.aspect = w / h;
+  v.camera.updateProjectionMatrix();
+}
+
+function loadStlIntoViewer(arrayBuffer) {
+  const v = ensureScadViewer();
+  if (!v) return;
+  if (typeof THREE.STLLoader !== 'function') {
+    $('#scadStatus').textContent = '✗ STLLoader 未加载';
+    return;
+  }
+  const loader = new THREE.STLLoader();
+  const geom = loader.parse(arrayBuffer);
+  geom.computeVertexNormals();
+  geom.center();
+
+  if (v.mesh) {
+    v.scene.remove(v.mesh);
+    v.mesh.geometry?.dispose();
+    v.mesh.material?.dispose();
+    v.mesh = null;
+  }
+  const mat = new THREE.MeshPhongMaterial({
+    color: 0x6aa3ff,
+    specular: 0x101820,
+    shininess: 40,
+    flatShading: false,
+  });
+  const mesh = new THREE.Mesh(geom, mat);
+  v.scene.add(mesh);
+  v.mesh = mesh;
+
+  // Frame the mesh.
+  geom.computeBoundingSphere();
+  const r = geom.boundingSphere?.radius || 30;
+  const d = r * 2.5;
+  v.camera.position.set(d, d, d);
+  v.camera.lookAt(0, 0, 0);
+  v.controls?.target?.set(0, 0, 0);
+  v.controls?.update();
 }
 
 init().catch((err) => {

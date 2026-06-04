@@ -27,6 +27,27 @@ const GOAL_DIR_REL = '.claude-goal';
 // guidance file and is explicitly preserved.
 const GOAL_ARTEFACT_FILES = ['task.md', 'plan.md', 'test.md'];
 
+// Stand-alone helper so callers outside of GoalRunner (notably session
+// creation) can also wipe stale per-task artefacts. Returns the list of files
+// actually removed so callers can log it.
+export function cleanGoalArtefacts(workdir) {
+  const cleaned = [];
+  try {
+    const dir = path.join(workdir, GOAL_DIR_REL);
+    if (!fs.existsSync(dir)) return cleaned;
+    for (const name of GOAL_ARTEFACT_FILES) {
+      const f = path.join(dir, name);
+      try {
+        if (fs.existsSync(f) && fs.statSync(f).isFile()) {
+          fs.unlinkSync(f);
+          cleaned.push(name);
+        }
+      } catch {}
+    }
+  } catch {}
+  return cleaned;
+}
+
 const DEFAULT_MAX_ITERATIONS = 12;
 
 const PHASE_LABELS = {
@@ -219,23 +240,13 @@ export class GoalRunner {
   // artefacts from a previous YOLO run. prompts.json (user-editable guidance)
   // is intentionally preserved.
   _prepareGoalDir() {
-    const cleaned = [];
     try {
       const dir = path.join(this.session.workdir, GOAL_DIR_REL);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      for (const name of GOAL_ARTEFACT_FILES) {
-        const f = path.join(dir, name);
-        try {
-          if (fs.existsSync(f) && fs.statSync(f).isFile()) {
-            fs.unlinkSync(f);
-            cleaned.push(name);
-          }
-        } catch {}
-      }
     } catch (e) {
       this._record('goal:warning', { message: `准备 .claude-goal 目录失败：${e.message}` });
     }
-    return cleaned;
+    return cleanGoalArtefacts(this.session.workdir);
   }
 
   _attachListener() {

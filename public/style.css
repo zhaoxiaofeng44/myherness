@@ -185,12 +185,65 @@ button { cursor: pointer; }
 }
 .approval-pane {
   flex-shrink: 0; padding: 0 24px;
-  max-height: 30vh; overflow-y: auto;
+  max-height: 40vh; overflow-y: auto;
 }
+/* 统一壳层 —— 所有待办合并到一个表单里，由底部唯一提交按钮收尾 */
+.approval-shell {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin-bottom: 10px;
+  overflow: hidden;
+  display: flex; flex-direction: column;
+}
+.approval-shell-head {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 14px;
+  background: rgba(106, 163, 255, 0.07);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.approval-shell-title { font-weight: 600; color: var(--accent); }
+.approval-shell-body { padding: 12px 14px 4px; display: flex; flex-direction: column; gap: 10px; }
+.approval-shell-footer {
+  display: flex; gap: 10px; align-items: center;
+  padding: 10px 14px;
+  background: var(--panel-2);
+  border-top: 1px solid var(--border);
+}
+.approval-shell-footer .primary-btn { padding: 8px 18px; font-size: 13px; }
+.approval-shell-footer .ghost-btn { margin-left: auto; }
+
 .approval-card {
   background: rgba(231, 198, 74, 0.08);
   border: 1px solid var(--yellow);
-  border-radius: 8px; padding: 12px 14px; margin-bottom: 10px;
+  border-radius: 8px; padding: 12px 14px;
+}
+.approval-card.approval-card-missing {
+  box-shadow: 0 0 0 2px var(--red);
+  animation: approval-missing-pulse 0.6s ease 0s 2;
+}
+@keyframes approval-missing-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px var(--red); }
+  50%      { box-shadow: 0 0 0 4px rgba(226, 91, 107, 0.4); }
+}
+
+.approval-decision { display: flex; align-items: center; gap: 8px; margin: 8px 0 4px; }
+.approval-decision-label { font-size: 12px; color: var(--muted); }
+.approval-decision-chips { display: flex; gap: 6px; }
+.approval-decision-chip {
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 5px 14px; font-size: 12px; cursor: pointer;
+}
+.approval-decision-chip:hover { border-color: var(--accent); color: var(--accent); }
+.approval-decision-chip.selected {
+  background: rgba(106, 163, 255, 0.18);
+  border-color: var(--accent); color: var(--accent);
+}
+.approval-decision-chip.reject.selected {
+  background: rgba(226, 91, 107, 0.18);
+  border-color: var(--red); color: var(--red);
 }
 .approval-card .approval-title {
   font-weight: 600; color: var(--yellow); margin-bottom: 4px;
@@ -952,4 +1005,44 @@ button { cursor: pointer; }
 }
 .terminal-panel.fullscreen .terminal-screen {
   flex: 1; height: auto; min-height: 0;
+}
+
+/* OpenSCAD view — left textarea, right 3D viewer */
+#view-scad { flex-direction: column; }
+.scad-toolbar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 16px; border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.scad-label { font-weight: 600; }
+.scad-toolbar-spacer { flex: 1; }
+.scad-toolbar .ghost-btn { font-size: 12px; }
+.scad-grid {
+  flex: 1; min-height: 0;
+  display: grid; grid-template-columns: 1fr 1fr;
+}
+.scad-edit-pane { display: flex; min-width: 0; border-right: 1px solid var(--border); }
+.scad-edit-pane textarea {
+  flex: 1; width: 100%;
+  background: var(--bg); color: var(--text);
+  border: 0; outline: none; resize: none;
+  padding: 12px 14px; font-size: 13px; line-height: 1.5;
+  font-family: var(--mono);
+}
+.scad-view-pane {
+  position: relative; display: flex; flex-direction: column; min-width: 0;
+  background: #14181f;
+}
+.scad-viewer {
+  flex: 1; min-height: 0;
+  background: #14181f;
+}
+.scad-viewer canvas { display: block; }
+.scad-log {
+  flex-shrink: 0; max-height: 30%; overflow: auto;
+  margin: 0; padding: 8px 10px;
+  background: rgba(0,0,0,0.4); color: #ffb4a2;
+  font-family: var(--mono); font-size: 11px; line-height: 1.45;
+  border-top: 1px solid var(--border);
+  white-space: pre-wrap;
 }

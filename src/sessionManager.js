@@ -17,7 +17,7 @@ import {
 } from './memoryEngine.js';
 import { decideToolApproval, decideAskUserQuestion } from './memoryDecider.js';
 import { relevantForPrompt } from './memoryRetriever.js';
-import { GoalRunner } from './goalRunner.js';
+import { GoalRunner, cleanGoalArtefacts } from './goalRunner.js';
 
 let _id = 0;
 const nextId = () => `s${Date.now().toString(36)}${(_id++).toString(36)}`;
@@ -55,17 +55,36 @@ export class SessionManager extends EventEmitter {
     } catch {}
     const parentId =
       parentSessionId && this.sessions.has(parentSessionId) ? parentSessionId : null;
+    const resolvedPolicy = policyId || 'balanced';
+    // Wipe stale .claude-goal/{task,plan,test}.md so the next run isn't
+    // confused by leftovers from a previous goal. Two trigger conditions:
+    //   (a) fresh YOLO session — clean before GoalRunner.start() so the user
+    //       sees a clean slate immediately after creation.
+    //   (b) "下一任务" flow (has parentSessionId) — even if the new session
+    //       isn't YOLO, leftover plan/test markdown in the workdir would
+    //       still leak into Claude's context and bias the next task.
+    let cleanedGoalArtefacts = [];
+    if (resolvedPolicy === 'yolo' || parentId) {
+      cleanedGoalArtefacts = cleanGoalArtefacts(abs);
+    }
     const session = new Session({
       id: nextId(),
       workdir: abs,
       name: name || path.basename(abs),
-      policyId: policyId || 'balanced',
+      policyId: resolvedPolicy,
       parentSessionId: parentId,
       bus: this,
     });
     session._store = this.store;
     session._memoryStore = this.memoryStore;
     session._deciderQueue = this.deciderQueue;
+    if (cleanedGoalArtefacts.length > 0) {
+      session._record({
+        type: 'goal:cleanup',
+        cleanedArtefacts: cleanedGoalArtefacts,
+        when: 'session-create',
+      });
+    }
     this.sessions.set(session.id, session);
     this.emit('session:created', session.summary());
     this.store?.scheduleSave(session);
@@ -796,6 +815,8 @@ class Session {
     // Compute file changes for the turn.
     const changedFiles = this.changeTracker.diff();
     if (changedFiles.length > 0 && turn) {
+      const MAX_DIFF_LINES = 5000;
+      const MAX_DIFF_LINE_CHARS = 2000;
       const enriched = changedFiles.map((c) => {
         let beforeContent = this.fileBaselines[c.relPath] ?? null;
         let afterContent = null;
@@ -804,8 +825,22 @@ class Session {
           afterContent = r.content;
         }
         let diffLines = null;
+        let diffTruncated = false;
         if (beforeContent != null || afterContent != null) {
-          diffLines = this.changeTracker.unifiedDiff(c.relPath, beforeContent || '', afterContent || '');
+          const raw = this.changeTracker.unifiedDiff(c.relPath, beforeContent || '', afterContent || '');
+          if (raw.length > MAX_DIFF_LINES) {
+            diffLines = raw.slice(0, MAX_DIFF_LINES);
+            diffTruncated = true;
+          } else {
+            diffLines = raw;
+          }
+          // Cap individual line length so a single very long line can't blow up the payload.
+          for (const ln of diffLines) {
+            if (typeof ln.text === 'string' && ln.text.length > MAX_DIFF_LINE_CHARS) {
+              ln.text = ln.text.slice(0, MAX_DIFF_LINE_CHARS) + '… (truncated)';
+              diffTruncated = true;
+            }
+          }
         }
         // Update baseline for next turn.
         if (afterContent != null) this.fileBaselines[c.relPath] = afterContent;
@@ -816,6 +851,7 @@ class Session {
           kind: c.kind,
           size: c.size,
           diff: diffLines,
+          diffTruncated: diffTruncated || undefined,
         };
       });
       const changeSet = {
