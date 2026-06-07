@@ -8,9 +8,6 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/examples/js/controls/OrbitControls.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/examples/js/loaders/STLLoader.js"></script>
   </head>
   <body>
     <div id="app">
@@ -36,7 +33,6 @@
             <li><button data-view="audit" class="nav-btn">审计回放</button></li>
             <li><button data-view="policy" class="nav-btn">策略</button></li>
             <li><button data-view="memory" class="nav-btn">记忆</button></li>
-            <li><button data-view="scad" class="nav-btn">SCAD</button></li>
           </ul>
         </nav>
 
@@ -146,27 +142,6 @@
 
         <section class="view hidden" id="view-memory">
           <div id="memoryView" class="memory-view"></div>
-        </section>
-
-        <section class="view hidden" id="view-scad">
-          <div class="scad-toolbar">
-            <span class="scad-label">OpenSCAD 编辑器</span>
-            <span id="scadHealthPill" class="status-pill">检测中…</span>
-            <button type="button" id="scadRenderBtn" class="primary-btn">渲染 (⌘/Ctrl+Enter)</button>
-            <button type="button" id="scadResetBtn" class="ghost-btn">恢复示例</button>
-            <span class="scad-toolbar-spacer"></span>
-            <span id="scadStatus" class="muted"></span>
-          </div>
-          <div class="scad-grid">
-            <div class="scad-edit-pane">
-              <textarea id="scadEditor" spellcheck="false"
-                placeholder="// OpenSCAD 代码"></textarea>
-            </div>
-            <div class="scad-view-pane">
-              <div id="scadViewer" class="scad-viewer"></div>
-              <pre id="scadLog" class="scad-log hidden"></pre>
-            </div>
-          </div>
         </section>
       </main>
     </div>

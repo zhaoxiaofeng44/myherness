@@ -53,6 +53,14 @@ export class SessionManager extends EventEmitter {
     try {
       abs = fs.realpathSync(abs);
     } catch {}
+    // 同目录只允许一个项目。带 parentSessionId 的是「下一任务」，属于同项目追加任务，放行。
+    if (!parentSessionId) {
+      for (const existing of this.sessions.values()) {
+        if (existing.workdir === abs) {
+          throw new Error(`该目录已存在项目「${existing.name}」，同一目录只能创建一个项目`);
+        }
+      }
+    }
     const parentId =
       parentSessionId && this.sessions.has(parentSessionId) ? parentSessionId : null;
     const resolvedPolicy = policyId || 'balanced';
@@ -94,10 +102,18 @@ export class SessionManager extends EventEmitter {
   remove(id) {
     const s = this.sessions.get(id);
     if (!s) return false;
-    s.stop();
-    this.sessions.delete(id);
-    this.store?.remove(id);
-    this.emit('session:removed', { id });
+    // 同一项目（=同一 workdir）下的所有会话一起清理，避免遗留孤立的链节点。
+    const projectDir = s.workdir;
+    const siblings = [];
+    for (const other of this.sessions.values()) {
+      if (other.workdir === projectDir) siblings.push(other);
+    }
+    for (const target of siblings) {
+      try { target.stop(); } catch {}
+      this.sessions.delete(target.id);
+      this.store?.remove(target.id);
+      this.emit('session:removed', { id: target.id });
+    }
     return true;
   }
 

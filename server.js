@@ -21,7 +21,6 @@ import { mergeHabit, mergeExperience, hashWorkdir } from './src/memoryEngine.js'
 import { relevantForPrompt } from './src/memoryRetriever.js';
 import { TerminalManager } from './src/terminalManager.js';
 import { GOAL_PROMPT_PATHS } from './src/goalRunner.js';
-import * as scadRenderer from './src/scadRenderer.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -125,25 +124,6 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, info);
     }
     if (pathname === '/api/policies') return json(res, 200, { policies: PRESET_POLICIES });
-
-    if (pathname === '/api/scad/health' && req.method === 'GET') {
-      const info = await scadRenderer.isAvailable();
-      return json(res, 200, info);
-    }
-    if (pathname === '/api/scad/render' && req.method === 'POST') {
-      const body = await readJson(req);
-      const src = typeof body.source === 'string' ? body.source : '';
-      if (!src.trim()) return json(res, 400, { error: 'source 必填' });
-      if (src.length > 500_000) return json(res, 400, { error: 'source 过大（>500KB）' });
-      const result = await scadRenderer.renderToStl(src);
-      if (!result.ok) return json(res, 200, { ok: false, error: result.error, log: result.log });
-      // Stream STL bytes back as binary. Keep log in a header so the UI can show it.
-      res.writeHead(200, {
-        'Content-Type': 'model/stl',
-        'X-Scad-Log': encodeURIComponent((result.log || '').slice(0, 4000)),
-      });
-      return res.end(result.stl);
-    }
 
     if (pathname === '/api/goal/info' && req.method === 'GET') {
       const wd = parsed.query.workdir || '';
