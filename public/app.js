@@ -73,6 +73,95 @@ function truncate(s, n = 200) {
   return s.length > n ? s.slice(0, n) + '…' : s;
 }
 
+// ===== Markdown rendering =====
+const _markedRenderer = new marked.Renderer();
+_markedRenderer.code = function (codeOrToken, lang) {
+  let code, language;
+  if (typeof codeOrToken === 'object' && codeOrToken !== null) {
+    code = codeOrToken.text || '';
+    language = codeOrToken.lang || '';
+  } else {
+    code = codeOrToken || '';
+    language = lang || '';
+  }
+  const langLabel = language ? escapeHtml(language) : '';
+  let highlighted;
+  if (language && hljs.getLanguage(language)) {
+    highlighted = hljs.highlight(code, { language }).value;
+  } else {
+    highlighted = hljs.highlightAuto(code).value;
+  }
+  return `<div class="code-block">
+    <div class="code-block-head"><span class="code-lang">${langLabel}</span><button class="code-copy-btn" data-action="copy-code">复制</button></div>
+    <pre><code class="hljs">${highlighted}</code></pre>
+  </div>`;
+};
+_markedRenderer.image = function (hrefOrToken, title, text) {
+  let href, alt, titleVal;
+  if (typeof hrefOrToken === 'object' && hrefOrToken !== null) {
+    href = hrefOrToken.href || '';
+    alt = hrefOrToken.text || '';
+    titleVal = hrefOrToken.title || '';
+  } else {
+    href = hrefOrToken || '';
+    alt = text || '';
+    titleVal = title || '';
+  }
+  const altAttr = escapeHtml(alt);
+  const titleAttr = titleVal ? ` title="${escapeHtml(titleVal)}"` : '';
+  return `<img src="${escapeHtml(href)}" alt="${altAttr}"${titleAttr} class="msg-img" data-action="lightbox" />`;
+};
+
+_markedRenderer.link = function (hrefOrToken, title, text) {
+  let href, linkTitle, linkText;
+  if (typeof hrefOrToken === 'object' && hrefOrToken !== null) {
+    href = hrefOrToken.href || '';
+    linkTitle = hrefOrToken.title || '';
+    linkText = hrefOrToken.text || '';
+  } else {
+    href = hrefOrToken || '';
+    linkTitle = title || '';
+    linkText = text || '';
+  }
+  const titleAttr = linkTitle ? ` title="${escapeHtml(linkTitle)}"` : '';
+  return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer"${titleAttr}>${linkText}</a>`;
+};
+
+marked.setOptions({
+  renderer: _markedRenderer,
+  gfm: true,
+  breaks: true,
+});
+
+function renderMarkdown(raw) {
+  if (!raw) return '';
+  const html = marked.parse(raw);
+  return DOMPurify.sanitize(html, {
+    ADD_TAGS: ['details', 'summary'],
+    ADD_ATTR: ['class', 'target', 'rel', 'data-action'],
+    FORBID_ATTR: ['onerror', 'onload', 'onmouseover', 'onclick', 'onfocus', 'onblur'],
+  });
+}
+
+// Event delegation for rendered markdown actions (copy-code, lightbox)
+document.addEventListener('click', (e) => {
+  const copyBtn = e.target.closest('[data-action="copy-code"]');
+  if (copyBtn) {
+    const pre = copyBtn.closest('.code-block').querySelector('pre code');
+    if (!pre) return;
+    navigator.clipboard.writeText(pre.textContent).then(() => {
+      copyBtn.textContent = '✓';
+      setTimeout(() => { copyBtn.textContent = '复制'; }, 1500);
+    });
+    return;
+  }
+  const img = e.target.closest('[data-action="lightbox"]');
+  if (img) {
+    openLightbox(img.src);
+    return;
+  }
+});
+
 // ===== Slash commands (autocomplete) =====
 const SLASH_COMMANDS = [
   { cmd: '/compact', desc: '压缩上下文 — 总结对话关键信息，释放上下文窗口' },
@@ -240,6 +329,32 @@ async function init() {
 
   $('#terminalRestartBtn').addEventListener('click', restartTerminal);
   $('#terminalFullscreenBtn').addEventListener('click', toggleTerminalFullscreen);
+
+  // Image upload handlers
+  $('#imageUploadBtn').addEventListener('click', () => $('#imageFileInput').click());
+  $('#imageFileInput').addEventListener('change', (e) => {
+    handleImageFiles(e.target.files);
+    e.target.value = '';
+  });
+  const promptInput = $('#promptInput');
+  promptInput.addEventListener('paste', (e) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const imageFiles = [];
+    for (const item of items) {
+      if (item.type.startsWith('image/')) imageFiles.push(item.getAsFile());
+    }
+    if (imageFiles.length) handleImageFiles(imageFiles);
+  });
+  const promptForm = $('#promptForm');
+  promptForm.addEventListener('dragover', (e) => { e.preventDefault(); promptForm.classList.add('drag-over'); });
+  promptForm.addEventListener('dragleave', () => promptForm.classList.remove('drag-over'));
+  promptForm.addEventListener('drop', (e) => {
+    e.preventDefault();
+    promptForm.classList.remove('drag-over');
+    const files = [...e.dataTransfer.files].filter(f => f.type.startsWith('image/'));
+    if (files.length) handleImageFiles(files);
+  });
 
   $('#promptInput').addEventListener('input', () => {
     updateSlashMenu();
@@ -1310,15 +1425,22 @@ function renderChatItem(it) {
     return msgBlock('user', '我', escapeHtml(it.text), fmtTime(it.ts));
   }
   if (it.kind === 'assistant') {
-    return msgBlock('assistant', 'Claude', escapeHtml(it.text), fmtTime(it.ts));
+    return msgBlock('assistant', 'Claude', renderMarkdown(it.text), fmtTime(it.ts));
   }
   if (it.kind === 'thinking') {
-    return msgBlock(
-      'system',
-      '思考',
-      `<span class="muted">${escapeHtml(truncate(it.text, 600))}</span>`,
-      fmtTime(it.ts),
-    );
+    const summary = escapeHtml(truncate(it.text, 80));
+    const full = escapeHtml(it.text || '');
+    return `
+      <div class="msg system">
+        <div class="avatar">思</div>
+        <div class="body">
+          <div class="head"><strong>思考</strong><span class="muted">${fmtTime(it.ts)}</span></div>
+          <details class="thinking-details">
+            <summary class="thinking-summary">${summary}</summary>
+            <div class="thinking-full">${full}</div>
+          </details>
+        </div>
+      </div>`;
   }
   if (it.kind === 'tool') {
     const decisionLabel = {
@@ -1346,10 +1468,12 @@ function renderChatItem(it) {
       </div>`;
   }
   if (it.kind === 'tool-result') {
+    const text = it.text || '';
+    const display = text.length > 3000 ? truncate(text, 3000) : text;
     return msgBlock(
       'tool',
       '结果',
-      `<div class="content">${escapeHtml(truncate(it.text || '', 1500))}</div>`,
+      `<div class="content tool-result-content">${renderMarkdown(display)}</div>`,
       fmtTime(it.ts),
       it.isError ? 'reject' : 'auto',
     );
@@ -1405,15 +1529,73 @@ function msgBlock(role, name, content, ts, extraCls = '') {
     </div>`;
 }
 
+// ===== Image upload state & helpers =====
+const pendingImages = []; // [{ base64, mimeType, name }]
+const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB per image
+
+function handleImageFiles(files) {
+  for (const file of files) {
+    if (!file.type.startsWith('image/')) continue;
+    if (file.size > MAX_IMAGE_SIZE) {
+      alert(`图片 ${file.name} 超过 5MB 限制`);
+      continue;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const base64 = reader.result.split(',')[1];
+      pendingImages.push({ base64, mimeType: file.type, name: file.name });
+      renderImagePreviews();
+    };
+    reader.readAsDataURL(file);
+  }
+}
+
+function renderImagePreviews() {
+  const row = $('#imagePreviewRow');
+  if (pendingImages.length === 0) {
+    row.classList.add('hidden');
+    row.innerHTML = '';
+    return;
+  }
+  row.classList.remove('hidden');
+  row.innerHTML = pendingImages.map((img, i) => `
+    <div class="image-preview-item">
+      <img src="data:${img.mimeType};base64,${img.base64}" alt="${escapeHtml(img.name)}" />
+      <button type="button" class="image-remove-btn" onclick="removeImage(${i})">×</button>
+    </div>
+  `).join('');
+}
+
+function removeImage(idx) {
+  pendingImages.splice(idx, 1);
+  renderImagePreviews();
+}
+window.removeImage = removeImage;
+
+// Lightbox
+function openLightbox(src) {
+  const overlay = document.createElement('div');
+  overlay.className = 'lightbox-overlay';
+  overlay.innerHTML = `<img src="${src}" class="lightbox-img" /><button class="lightbox-close">×</button>`;
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay || e.target.classList.contains('lightbox-close')) overlay.remove();
+  });
+  document.body.appendChild(overlay);
+}
 async function submitPrompt(e) {
   e.preventDefault();
   const txt = $('#promptInput').value.trim();
   if (!txt || !state.activeSessionId) return;
   $('#promptInput').value = '';
+  const body = { prompt: txt };
+  if (pendingImages.length > 0) {
+    body.images = pendingImages.splice(0);
+    renderImagePreviews();
+  }
   try {
     await api(`/api/sessions/${state.activeSessionId}/prompt`, {
       method: 'POST',
-      body: JSON.stringify({ prompt: txt }),
+      body: JSON.stringify(body),
     });
   } catch (err) {
     alert('发送失败：' + err.message);

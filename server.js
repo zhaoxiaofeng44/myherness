@@ -291,7 +291,8 @@ const server = http.createServer(async (req, res) => {
         if (!body.prompt || typeof body.prompt !== 'string')
           return json(res, 400, { error: 'prompt 必填' });
         try {
-          const turn = await session.sendPrompt(body.prompt);
+          const images = Array.isArray(body.images) ? body.images : undefined;
+          const turn = await session.sendPrompt(body.prompt, { images });
           return json(res, 202, { turn });
         } catch (e) {
           return json(res, 400, { error: e.message });

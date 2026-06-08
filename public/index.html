@@ -6,8 +6,12 @@
     <title>Claude Code Console</title>
     <link rel="stylesheet" href="/style.css" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css" />
     <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/highlight.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
   </head>
   <body>
     <div id="app">
@@ -61,11 +65,14 @@
               <button id="newTaskBtn" type="button" class="ghost-btn"
                 title="复用当前工作目录与策略，开启下一个任务（新建会话）" disabled>＋ 下一任务</button>
             </div>
+            <div id="imagePreviewRow" class="image-preview-row hidden"></div>
             <div class="prompt-input-row">
               <div class="prompt-input-wrap">
                 <textarea id="promptInput" placeholder="向 Claude Code 发送指令…（Cmd/Ctrl + Enter 发送）" rows="3"></textarea>
                 <div id="slashMenu" class="slash-menu hidden"></div>
               </div>
+              <input type="file" id="imageFileInput" accept="image/*" multiple hidden />
+              <button type="button" id="imageUploadBtn" class="ghost-btn image-upload-btn" title="上传图片（支持粘贴/拖拽）">🖼</button>
               <button type="submit" class="primary-btn">发送</button>
             </div>
             <div id="terminalPanel" class="terminal-panel">

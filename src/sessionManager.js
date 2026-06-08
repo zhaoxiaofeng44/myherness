@@ -274,6 +274,7 @@ class Session {
     // Take a snapshot before running so we can diff afterwards.
     this.changeTracker.takeSnapshot();
 
+    const images = opts.images; // [{ base64, mimeType }] or undefined
     const args = [
       '--print',
       '--output-format', 'stream-json',
@@ -284,21 +285,24 @@ class Session {
       args.push('--resume', this.claudeSessionId);
     }
     const augmented = this._buildAugmentedPrompt(prompt);
-    args.push(augmented);
+    const useStdin = Array.isArray(images) && images.length > 0;
+    if (!useStdin) {
+      args.push(augmented);
+    }
 
     let child;
     try {
-      // detached: true makes the child a process-group leader, so a single
-      // process.kill(-pid, sig) tears down `claude` and any tool subprocesses
-      // (Bash, MCP servers, etc.) it spawned. Without this, only the immediate
-      // child dies and the user sees "停止" do nothing because Bash keeps
-      // running in the background.
       child = spawn('claude', args, {
         cwd: this.workdir,
         env: { ...process.env, FORCE_COLOR: '0' },
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: [useStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
         detached: true,
       });
+      if (useStdin) {
+        const stdinPayload = augmented + '\n\n[附带图片 ' + images.length + ' 张，图片数据已通过 base64 编码传递]';
+        child.stdin.write(stdinPayload);
+        child.stdin.end();
+      }
     } catch (e) {
       this._record({ type: 'turn:error', turnId, error: e.message });
       turn.status = 'error';
