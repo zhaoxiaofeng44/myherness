@@ -86,6 +86,7 @@ export class SessionManager extends EventEmitter {
     session._store = this.store;
     session._memoryStore = this.memoryStore;
     session._deciderQueue = this.deciderQueue;
+    session.changeTracker.takeSnapshot();
     if (cleanedGoalArtefacts.length > 0) {
       session._record({
         type: 'goal:cleanup',
@@ -153,8 +154,6 @@ export class SessionManager extends EventEmitter {
     const workdirOk =
       fs.existsSync(persisted.workdir) && fs.statSync(persisted.workdir).isDirectory();
     if (workdirOk) {
-      // Re-snapshot so the next turn diffs against the post-restart state.
-      session.changeTracker.takeSnapshot();
       let status = persisted.status;
       if (status === 'running' || status === 'waiting' || status === 'cancelling') status = 'idle';
       session.status = status || 'idle';
@@ -205,7 +204,6 @@ class Session {
     this.lastChangeMap = {}; // relPath -> { turn, kind }
 
     this.changeTracker = new ChangeTracker(workdir);
-    this.changeTracker.takeSnapshot();
     this.fileBaselines = {}; // relPath -> content snapshot for diff display
 
     this.activeChild = null;
@@ -314,6 +312,7 @@ class Session {
     }
     this.activeChild = child;
     this._cancelRequested = false;
+    this._killedForPendingInput = false;
     if (this._killEscalateTimer) {
       clearTimeout(this._killEscalateTimer);
       this._killEscalateTimer = null;
@@ -354,6 +353,7 @@ class Session {
       // a non-zero exit from a SIGTERM/SIGKILL is expected, not a real failure.
       let outcome;
       if (this._cancelRequested) outcome = 'cancelled';
+      else if (this._killedForPendingInput) outcome = 'paused';
       else if (code === 0) outcome = 'done';
       else outcome = 'error';
       if (outcome === 'error' && stderrBuf) {
@@ -555,6 +555,24 @@ class Session {
 
     // Path B: kick off async LLM decider if memory is available.
     this._maybeKickoffDecider(record);
+
+    // AskUserQuestion / ExitPlanMode in --print (non-interactive) mode:
+    // The CLI auto-cancels the tool (stdin is not interactive), Claude sees
+    // "cancelled" and retries — looping until the context thrashes.
+    // Kill the CLI immediately so the user can answer in the console UI;
+    // the answer will be sent as a --resume follow-up via _queueAUQFollowUp.
+    if (
+      (block.name === 'AskUserQuestion' || block.name === 'ExitPlanMode') &&
+      this.activeChild
+    ) {
+      this._killedForPendingInput = true;
+      this._signalChildGroup('SIGTERM');
+      if (!this._killEscalateTimer) {
+        this._killEscalateTimer = setTimeout(() => {
+          if (this.activeChild) this._signalChildGroup('SIGKILL');
+        }, 2500);
+      }
+    }
   }
 
   _maybeKickoffDecider(record) {
@@ -762,6 +780,10 @@ class Session {
         this._queueAUQFollowUp({ auqAnswers: auqAnswers || [], note: note || '' });
       }
     }
+    // ExitPlanMode 接续：用户确认计划后，自动发送继续指令让 Claude 开始执行。
+    if (rec.tool === 'ExitPlanMode' && decision === 'auto') {
+      this._queuePlanConfirmFollowUp(note || '');
+    }
     return true;
   }
 
@@ -802,6 +824,27 @@ class Session {
       setImmediate(() => {
         this.sendPrompt(prompt, { fromAUQ: true }).catch((e) => {
           this._record({ type: 'turn:error', error: 'AUQ 接续失败: ' + e.message });
+        });
+      });
+    }
+  }
+
+  _queuePlanConfirmFollowUp(note) {
+    if (this._pendingFollowUp) return;
+    const feedback = (note || '').trim();
+    const prompt = [
+      '我已在 ExitPlanMode 弹窗里确认了你的计划（请忽略 CLI 在非交互模式下',
+      '自动填充的「取消」tool_result，那是默认行为，不代表我的真实选择）。',
+      feedback ? `\n补充意见：${feedback}\n` : '',
+      '请开始按计划执行。',
+    ].filter(Boolean).join('\n');
+
+    if (this.activeChild) {
+      this._pendingFollowUp = prompt;
+    } else {
+      setImmediate(() => {
+        this.sendPrompt(prompt, { fromAUQ: true }).catch((e) => {
+          this._record({ type: 'turn:error', error: 'ExitPlanMode 接续失败: ' + e.message });
         });
       });
     }
@@ -895,7 +938,12 @@ class Session {
     }
 
     this.activeTurn = null;
-    this.status = reason === 'error' ? 'error' : 'idle';
+    this._killedForPendingInput = false;
+    if (this.pendingApprovals.size > 0) {
+      this.status = 'waiting';
+    } else {
+      this.status = reason === 'error' ? 'error' : 'idle';
+    }
     this._broadcastSummary();
 
     // 排空 AUQ 接续：上一轮里用户回答的内容，作为新一轮 prompt 自动发出。

@@ -132,6 +132,36 @@ button { cursor: pointer; }
 .session-list .session-item.history .si-meta { font-size: 10px; }
 .session-list .session-item.history.active { opacity: 1; }
 
+.session-list .session-item.remote {
+  border-left: 3px solid var(--accent);
+  padding-left: 8px;
+}
+.session-list .session-item.remote.active {
+  border-left-color: var(--green);
+}
+
+.si-group-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted);
+  padding: 10px 10px 4px;
+  list-style: none;
+}
+.si-group-label.remote-group-label {
+  color: var(--accent);
+}
+
+.peer-status {
+  font-size: 11px;
+  padding: 6px 0;
+  color: var(--muted);
+}
+.peer-status.connected { color: var(--green); }
+.peer-status.searching { color: var(--yellow); }
+.peer-status.standalone { color: var(--muted); }
+
 .footer-status {
   font-size: 11px; color: var(--muted); padding-top: 12px;
   border-top: 1px solid var(--border); margin-top: 12px;
@@ -965,37 +995,57 @@ button { cursor: pointer; }
   font-family: inherit;
 }
 
-/* Terminal panel — xterm.js attached to a per-session PTY */
-.terminal-panel {
-  margin-top: 10px;
+/* Bottom tabs — input / terminal tab switcher */
+.bottom-tabs {
+  margin-top: 6px;
   display: flex; flex-direction: column;
   border: 1px solid var(--border); border-radius: 6px;
-  background: #0b0e14; color: #d1d5db;
-  overflow: hidden;
+  background: var(--panel-2);
+  position: relative;
 }
-.terminal-head {
-  display: flex; align-items: center; gap: 8px;
-  padding: 6px 10px; background: #11151c;
+.bottom-tab-bar {
+  display: flex; align-items: center; gap: 0;
+  padding: 0 8px;
+  background: #11151c;
   border-bottom: 1px solid var(--border);
   font-size: 12px;
+  min-height: 32px;
 }
-.terminal-label { color: #6b7280; font-size: 11px; letter-spacing: 0.5px; }
-.terminal-cwd {
-  flex: 1; color: #93c5fd;
+.bottom-tab-btn {
+  padding: 6px 14px; cursor: pointer;
+  background: transparent; color: #6b7280;
+  border: none; border-bottom: 2px solid transparent;
+  font-size: 12px; font-weight: 500;
+  transition: color .15s, border-color .15s;
+}
+.bottom-tab-btn:hover { color: var(--text); }
+.bottom-tab-btn.active {
+  color: var(--accent); border-bottom-color: var(--accent);
+}
+.bottom-tab-spacer { flex: 1; }
+.bottom-tab-bar .terminal-cwd {
+  color: #93c5fd; font-size: 11px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: 260px;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
-.terminal-head .ghost-btn { font-size: 11px; padding: 3px 8px; }
-.terminal-screen { height: 80px; padding: 4px 6px; }
+.bottom-tab-bar .ghost-btn { font-size: 11px; padding: 3px 8px; }
+.bottom-tab-term-action { display: none; }
+.bottom-tabs[data-active="terminal"] .bottom-tab-term-action { display: inline-block; }
+.bottom-tab-panel { padding: 6px; }
+.bottom-tab-panel-hidden {
+  position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden;
+}
+
+/* Terminal screen inside bottom tabs */
+.terminal-screen { height: 80px; padding: 4px 6px; background: #0b0e14; border-radius: 4px; }
 .terminal-screen .xterm,
 .terminal-screen .xterm-viewport,
 .terminal-screen .xterm-screen { height: 100% !important; }
 .terminal-screen .xterm-viewport { background-color: transparent !important; }
 
-/* Fullscreen — terminal panel takes over the right area (everything inside
-   .main), leaving the sidebar untouched. Sidebar is 280px wide per #app's
-   grid-template-columns, so we anchor at left:280px. */
-.terminal-panel.fullscreen {
+/* Fullscreen — bottom-tabs takes over the right area */
+.bottom-tabs.fullscreen {
   position: fixed;
   left: 280px; top: 0; right: 0; bottom: 0;
   margin: 0;
@@ -1003,8 +1053,23 @@ button { cursor: pointer; }
   z-index: 50;
   display: flex; flex-direction: column;
 }
-.terminal-panel.fullscreen .terminal-screen {
+.bottom-tabs.fullscreen .bottom-tab-panel {
+  flex: 1; display: flex; flex-direction: column; min-height: 0;
+}
+.bottom-tabs.fullscreen .bottom-tab-panel-hidden {
+  display: none;
+}
+.bottom-tabs.fullscreen .terminal-screen {
   flex: 1; height: auto; min-height: 0;
+}
+.bottom-tabs.fullscreen .prompt-input-row {
+  flex: 1; flex-direction: column;
+}
+.bottom-tabs.fullscreen .prompt-input-wrap {
+  flex: 1; display: flex; flex-direction: column;
+}
+.bottom-tabs.fullscreen .prompt-input-wrap textarea {
+  flex: 1; max-height: none; resize: none;
 }
 
 /* ===== Markdown rendered content ===== */

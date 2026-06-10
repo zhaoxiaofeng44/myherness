@@ -18,6 +18,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
+import { checkNetwork } from './networkUtils.js';
 
 const GLOBAL_PROMPT_FILE = path.join(os.homedir(), '.claude-console', 'goal-prompts.json');
 const PROJECT_PROMPT_REL = path.join('.claude-goal', 'prompts.json');
@@ -49,6 +50,8 @@ export function cleanGoalArtefacts(workdir) {
 }
 
 const DEFAULT_MAX_ITERATIONS = 12;
+const INITIAL_RETRY_DELAY = 15_000;  // 15s
+const MAX_RETRY_DELAY = 600_000;     // 10 min
 
 const PHASE_LABELS = {
   planning: '规划中',
@@ -200,6 +203,9 @@ export class GoalRunner {
     this.guidance = loadCustomGuidance(session.workdir);
     this._unsubscribe = null;
     this._lastHandledTurnId = null;
+    this._retryDelay = INITIAL_RETRY_DELAY;
+    this._retryTimer = null;
+    this._retryResolve = null;
   }
 
   summary() {
@@ -212,6 +218,8 @@ export class GoalRunner {
       status: this.status,
       reason: this.lastReason,
       task: this.task,
+      retrying: this._retryTimer != null,
+      retryDelay: this._retryDelay,
     };
   }
 
@@ -232,6 +240,14 @@ export class GoalRunner {
     if (this.status !== 'active') return;
     this.status = 'aborted';
     this.lastReason = reason;
+    if (this._retryTimer) {
+      clearTimeout(this._retryTimer);
+      this._retryTimer = null;
+    }
+    if (this._retryResolve) {
+      this._retryResolve();
+      this._retryResolve = null;
+    }
     this._detachListener();
     this._record('goal:aborted', { reason });
   }
@@ -298,8 +314,15 @@ export class GoalRunner {
 
   _onTurnEnd(evt) {
     if (this.status !== 'active') return;
-    // If the turn errored or was cancelled, halt the loop — the user can
-    // restart manually rather than have us hammer a broken environment.
+    // 'paused' means the turn was killed to wait for user input (AUQ/ExitPlanMode).
+    // The follow-up mechanism will resume the session; just ignore this turn end.
+    if (evt.status === 'paused') return;
+    // Error: attempt automatic retry with exponential backoff.
+    if (evt.status === 'error') {
+      this._attemptRetry(evt.status);
+      return;
+    }
+    // Cancelled or other non-done status: halt immediately (user-initiated).
     if (evt.status && evt.status !== 'done') {
       this.status = 'failed';
       this.lastReason = `轮次以 ${evt.status} 结束，自动停止 Goal 闭环`;
@@ -308,6 +331,9 @@ export class GoalRunner {
       this._broadcast();
       return;
     }
+
+    // Success — reset retry delay back to initial value.
+    this._retryDelay = INITIAL_RETRY_DELAY;
 
     const text = this._lastAssistantTextForTurn(evt.turnId);
     const tail = parsePhaseTail(text);
@@ -424,6 +450,48 @@ export class GoalRunner {
   _sendEvaluation() {
     const prompt = buildEvaluationPrompt({ iteration: this.iteration });
     this._queue(prompt);
+  }
+
+  async _attemptRetry(reason) {
+    while (this.status === 'active') {
+      const delay = this._retryDelay;
+      this._record('goal:retry-waiting', { reason, delayMs: delay });
+      this._broadcast();
+
+      await this._sleep(delay);
+      if (this.status !== 'active') return;
+
+      const networkOk = await checkNetwork();
+      if (!networkOk) {
+        this._retryDelay = Math.min(this._retryDelay * 2, MAX_RETRY_DELAY);
+        this._record('goal:network-unavailable', { nextDelayMs: this._retryDelay });
+        this._broadcast();
+        continue;
+      }
+
+      this._record('goal:retrying', {});
+      this._broadcast();
+      try {
+        await this.session.sendPrompt('继续', { fromGoal: true });
+        this._retryDelay = Math.min(this._retryDelay * 2, MAX_RETRY_DELAY);
+        return;
+      } catch (e) {
+        this._record('goal:retry-send-failed', { error: e.message });
+        this._retryDelay = Math.min(this._retryDelay * 2, MAX_RETRY_DELAY);
+      }
+    }
+  }
+
+  _sleep(ms) {
+    return new Promise((resolve) => {
+      this._retryResolve = resolve;
+      this._retryTimer = setTimeout(() => {
+        this._retryTimer = null;
+        this._retryResolve = null;
+        resolve();
+      }, ms);
+      this._retryTimer.unref();
+    });
   }
 
   _queue(prompt) {

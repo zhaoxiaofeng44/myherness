@@ -41,12 +41,17 @@ const state = {
   depositSelected: null,  // { habits: Set<idx>, experiences: Set<idx> }
   lastDepositTurnId: null, // most recently finished turn — used by toolbar button
   terminal: null, // { term, fit, attachedSessionId, resizeObserver }
+  bottomTab: 'input', // 'input' | 'terminal'
   suggestRelevant: [],    // experiences relevant to current prompt input
   suggestExpanded: false, // 相关经验默认折叠，点击标题展开
   suggestDebounce: null,
   expandedHeads: new Set(), // chain heads whose history list is expanded
   pendingPromptDraft: null, // { sessionId, text } — applied once active session matches
   approvalRenderSig: null,  // signature of last-rendered approval pane (id:deciderState|...)
+  // ===== Remote peers =====
+  peers: [],          // [{ id, name, host, httpPort }]
+  lanMode: false,
+  remoteSessions: [], // [{ ...session, _peerId, _peerName }]
 };
 
 // ===== Utility =====
@@ -139,7 +144,8 @@ function renderMarkdown(raw) {
   return DOMPurify.sanitize(html, {
     ADD_TAGS: ['details', 'summary'],
     ADD_ATTR: ['class', 'target', 'rel', 'data-action'],
-    FORBID_ATTR: ['onerror', 'onload', 'onmouseover', 'onclick', 'onfocus', 'onblur'],
+    FORBID_ATTR: ['onerror', 'onload', 'onmouseover', 'onclick', 'onfocus', 'onblur', 'id', 'name'],
+    FORBID_TAGS: ['form', 'input', 'textarea', 'select'],
   });
 }
 
@@ -273,6 +279,48 @@ async function api(path, opts = {}) {
   return res.json();
 }
 
+function apiPathFor(session, subpath) {
+  if (session && session._peerId) {
+    return `/api/remote/${session._peerId}/sessions/${session.id}${subpath}`;
+  }
+  return `/api/sessions/${session ? session.id : ''}${subpath}`;
+}
+
+async function refreshPeers() {
+  try {
+    const resp = await api('/api/peers');
+    state.peers = resp.peers || [];
+    state.lanMode = resp.lanMode;
+    renderPeerStatus();
+    const remoteSessions = [];
+    for (const peer of state.peers) {
+      try {
+        const r = await api(`/api/remote/${peer.id}/sessions`);
+        for (const s of (r.sessions || [])) {
+          remoteSessions.push({ ...s, _peerId: peer.id, _peerName: peer.name });
+        }
+      } catch {}
+    }
+    state.remoteSessions = remoteSessions;
+    renderSessionList();
+  } catch {}
+}
+
+function renderPeerStatus() {
+  const el = $('#peerStatus');
+  if (!el) return;
+  if (!state.lanMode) {
+    el.textContent = '单机模式';
+    el.className = 'peer-status standalone';
+  } else if (state.peers.length === 0) {
+    el.textContent = '局域网·未发现设备';
+    el.className = 'peer-status searching';
+  } else {
+    el.textContent = `局域网·${state.peers.length} 台设备`;
+    el.className = 'peer-status connected';
+  }
+}
+
 // ===== Initial bootstrap =====
 async function init() {
   $('#newSessionBtn').addEventListener('click', openNewSessionDialog);
@@ -328,7 +376,15 @@ async function init() {
   });
 
   $('#terminalRestartBtn').addEventListener('click', restartTerminal);
-  $('#terminalFullscreenBtn').addEventListener('click', toggleTerminalFullscreen);
+  $$('.bottom-tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => switchBottomTab(btn.dataset.bottomTab));
+  });
+  $('#bottomFullscreenBtn').addEventListener('click', toggleBottomFullscreen);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && $('#bottomTabs')?.classList.contains('fullscreen')) {
+      toggleBottomFullscreen();
+    }
+  });
 
   // Image upload handlers
   $('#imageUploadBtn').addEventListener('click', () => $('#imageFileInput').click());
@@ -373,6 +429,7 @@ async function init() {
   await refreshSessions();
   connectEvents();
   renderPolicyView();
+  refreshPeers();
 }
 
 function populatePolicySelectors() {
@@ -450,6 +507,32 @@ function connectEvents() {
       renderGitNexusLog();
     }
   });
+
+  // ===== Remote peer events =====
+  es.addEventListener('peer:added', () => refreshPeers());
+  es.addEventListener('peer:removed', () => refreshPeers());
+  es.addEventListener('remote:session:created', () => refreshPeers());
+  es.addEventListener('remote:session:removed', () => refreshPeers());
+  es.addEventListener('remote:session:updated', (e) => {
+    const data = JSON.parse(e.data);
+    const peerId = data.peerId;
+    const peer = state.peers.find((p) => p.id === peerId);
+    const idx = state.remoteSessions.findIndex((s) => s.id === data.id && s._peerId === peerId);
+    const enriched = { ...data, _peerId: peerId, _peerName: peer?.name || peerId };
+    delete enriched.peerId;
+    if (idx >= 0) state.remoteSessions[idx] = enriched;
+    else state.remoteSessions.push(enriched);
+    if (data.id === state.activeSessionId && state.detail) {
+      state.detail.session = enriched;
+      renderTopbar();
+    }
+    renderSessionList();
+  });
+  es.addEventListener('remote:event', (e) => {
+    const data = JSON.parse(e.data);
+    if (data.sessionId !== state.activeSessionId) return;
+    handleSessionEvent(data.event);
+  });
 }
 
 async function refreshSessions() {
@@ -485,21 +568,23 @@ async function deleteSession(id) {
 
 function renderSessionList() {
   const ul = $('#sessionList');
-  if (state.sessions.length === 0) {
+  const allLocal = state.sessions;
+  const allRemote = state.remoteSessions || [];
+  if (allLocal.length === 0 && allRemote.length === 0) {
     ul.innerHTML = '<li class="muted" style="padding:6px 10px;font-size:12px">还没有会话</li>';
     return;
   }
 
   // A "head" is a session that no other session points to via parentSessionId.
   // History walks parentSessionId backwards from the head until null/missing.
-  const sessionMap = new Map(state.sessions.map((s) => [s.id, s]));
+  const sessionMap = new Map(allLocal.map((s) => [s.id, s]));
   const isParentOf = new Set();
-  for (const s of state.sessions) {
+  for (const s of allLocal) {
     if (s.parentSessionId && sessionMap.has(s.parentSessionId)) {
       isParentOf.add(s.parentSessionId);
     }
   }
-  const heads = state.sessions
+  const heads = allLocal
     .filter((s) => !isParentOf.has(s.id))
     .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 
@@ -518,6 +603,10 @@ function renderSessionList() {
   }
 
   const blocks = [];
+
+  if (allLocal.length > 0) {
+    blocks.push('<li class="si-group-label">本机</li>');
+  }
   for (const head of heads) {
     const history = buildHistory(head.id);
     const expanded = state.expandedHeads.has(head.id);
@@ -537,6 +626,23 @@ function renderSessionList() {
       }
     }
   }
+
+  // Remote sessions grouped by peer
+  const byPeer = new Map();
+  for (const rs of allRemote) {
+    const key = rs._peerId;
+    if (!byPeer.has(key)) byPeer.set(key, []);
+    byPeer.get(key).push(rs);
+  }
+  for (const [peerId, sessions] of byPeer) {
+    const peerName = sessions[0]?._peerName || peerId;
+    blocks.push(`<li class="si-group-label remote-group-label">${escapeHtml(peerName)}</li>`);
+    const sorted = sessions.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    for (const rs of sorted) {
+      blocks.push(renderSessionItem(rs, { isHead: true, isRemote: true }));
+    }
+  }
+
   ul.innerHTML = blocks.join('');
 
   $$('.session-item').forEach((el) => {
@@ -564,10 +670,11 @@ function renderSessionList() {
 }
 
 function renderSessionItem(s, opts) {
-  const { isHead, historyCount = 0, expanded = false, headId, hidden = '' } = opts;
+  const { isHead, historyCount = 0, expanded = false, headId, hidden = '', isRemote = false } = opts;
   const classes = ['session-item'];
   if (s.id === state.activeSessionId) classes.push('active');
   if (!isHead) classes.push('history');
+  if (isRemote) classes.push('remote');
   const status = renderStatusBadge(s.status);
   const toggle =
     isHead && historyCount > 0
@@ -582,7 +689,7 @@ function renderSessionItem(s, opts) {
       <div class="si-name">
         ${toggle}
         <span class="si-name-text">${escapeHtml(s.name)}</span>${status}
-        <button class="si-delete" data-del="${s.id}" title="删除会话">×</button>
+        ${isRemote ? '' : `<button class="si-delete" data-del="${s.id}" title="删除会话">×</button>`}
       </div>
       <div class="si-meta">${escapeHtml(s.workdir)}</div>
     </li>`;
@@ -652,12 +759,29 @@ async function selectSession(id) {
   renderAll();
 }
 
+function findSession(id) {
+  const local = state.sessions.find((s) => s.id === id);
+  if (local) return local;
+  return state.remoteSessions.find((s) => s.id === id) || null;
+}
+
+function getActiveSession() {
+  return state.detail?.session || findSession(state.activeSessionId);
+}
+
 async function loadDetail() {
   if (!state.activeSessionId) {
     state.detail = null;
     return;
   }
-  state.detail = await api(`/api/sessions/${state.activeSessionId}`);
+  const sess = findSession(state.activeSessionId);
+  if (sess && sess._peerId) {
+    state.detail = await api(`/api/remote/${sess._peerId}/sessions/${state.activeSessionId}`);
+    state.detail.session._peerId = sess._peerId;
+    state.detail.session._peerName = sess._peerName;
+  } else {
+    state.detail = await api(`/api/sessions/${state.activeSessionId}`);
+  }
   $('#policySelect').value = state.detail.session.policyId;
 }
 
@@ -922,6 +1046,8 @@ function renderChatView() {
       items.push({ kind: 'system', text: '已请求停止…', ts: e.ts });
     } else if (e.type === 'turn:end' && e.status === 'cancelled') {
       items.push({ kind: 'system', text: '本轮已取消', ts: e.ts });
+    } else if (e.type === 'turn:end' && e.status === 'paused') {
+      items.push({ kind: 'system', text: '已暂停，等待你的输入后继续', ts: e.ts });
     } else if (e.type === 'system' && e.subtype === 'init') {
       items.push({
         kind: 'system',
@@ -1593,10 +1719,9 @@ async function submitPrompt(e) {
     renderImagePreviews();
   }
   try {
-    await api(`/api/sessions/${state.activeSessionId}/prompt`, {
-      method: 'POST',
-      body: JSON.stringify(body),
-    });
+    const sess = getActiveSession();
+    const path = apiPathFor(sess, '/prompt');
+    await api(path, { method: 'POST', body: JSON.stringify(body) });
   } catch (err) {
     alert('发送失败：' + err.message);
   }
@@ -1604,7 +1729,8 @@ async function submitPrompt(e) {
 async function cancelTurn() {
   if (!state.activeSessionId) return;
   try {
-    await api(`/api/sessions/${state.activeSessionId}/cancel`, { method: 'POST' });
+    const sess = getActiveSession();
+    await api(apiPathFor(sess, '/cancel'), { method: 'POST' });
   } catch (e) {}
 }
 // Spin up a fresh session reusing the current session's workdir + policy.
@@ -1714,13 +1840,15 @@ function buildNextTaskDraft(detail) {
 async function changePolicy() {
   if (!state.activeSessionId) return;
   const policyId = $('#policySelect').value;
-  await api(`/api/sessions/${state.activeSessionId}/policy`, {
+  const sess = getActiveSession();
+  await api(apiPathFor(sess, '/policy'), {
     method: 'POST',
     body: JSON.stringify({ policyId }),
   });
 }
 async function resolveApproval(id, action, note, auqAnswers) {
-  await api(`/api/sessions/${state.activeSessionId}/approve/${id}`, {
+  const sess = getActiveSession();
+  await api(apiPathFor(sess, `/approve/${id}`), {
     method: 'POST',
     body: JSON.stringify({
       decision: action === 'approve' ? 'auto' : 'reject',
@@ -1733,7 +1861,8 @@ async function resolveApproval(id, action, note, auqAnswers) {
 async function cancelDecider(toolUseId) {
   if (!state.activeSessionId) return;
   try {
-    await api(`/api/sessions/${state.activeSessionId}/approvals/${toolUseId}/cancel-decider`, {
+    const sess = getActiveSession();
+    await api(apiPathFor(sess, `/approvals/${toolUseId}/cancel-decider`), {
       method: 'POST',
     });
   } catch (e) {
@@ -1803,7 +1932,7 @@ function renderChangesView() {
 // ===== Structure view =====
 async function loadStructure() {
   if (!state.activeSessionId) return;
-  const resp = await api(`/api/sessions/${state.activeSessionId}/structure`);
+  const resp = await api(apiPathFor(getActiveSession(), '/structure'));
   state.structureCache = resp.tree;
   renderStructureView();
 }
@@ -1919,7 +2048,7 @@ async function loadDesignGraph() {
   const info = $('#graphInfo');
   info.textContent = '正在分析模块依赖（madge）…';
   try {
-    const resp = await api(`/api/sessions/${state.activeSessionId}/design-graph?type=modules`);
+    const resp = await api(apiPathFor(getActiveSession(), '/design-graph?type=modules'));
     state.graphCache = resp.graph;
   } catch (e) {
     info.textContent = '加载失败：' + e.message;
@@ -2273,7 +2402,7 @@ async function loadCodeMap() {
   $('#codemapTree').innerHTML = '';
   $('#codemapDetail').innerHTML = '';
   try {
-    const resp = await api(`/api/sessions/${state.activeSessionId}/code-map`);
+    const resp = await api(apiPathFor(getActiveSession(), '/code-map'));
     state.codeMapCache = resp.map;
   } catch (e) {
     $('#codemapOverview').innerHTML = `<div class="muted">加载失败：${escapeHtml(e.message)}</div>`;
@@ -2666,7 +2795,7 @@ async function loadGitNexusStatus() {
   if (!state.activeSessionId) return;
   $('#gitNexusStatus').innerHTML = '<span class="muted">读取索引状态…</span>';
   try {
-    state.gitNexusStatus = await api(`/api/sessions/${state.activeSessionId}/gitnexus/status`);
+    state.gitNexusStatus = await api(apiPathFor(getActiveSession(), '/gitnexus/status'));
   } catch (e) {
     state.gitNexusStatus = { error: e.message };
   }
@@ -2679,7 +2808,7 @@ async function triggerGitNexusAnalyze(force = false) {
   state.gitNexusLog = [];
   renderGitNexusStatus();
   try {
-    await api(`/api/sessions/${state.activeSessionId}/gitnexus/analyze`, {
+    await api(apiPathFor(getActiveSession(), '/gitnexus/analyze'), {
       method: 'POST',
       body: JSON.stringify({ force }),
     });
@@ -2771,7 +2900,7 @@ async function loadGitNexusCallGraph() {
   const pane = $('#gitNexusPane');
   pane.innerHTML = '<div class="muted" style="padding:14px">读取调用图（cypher）…</div>';
   try {
-    const resp = await api(`/api/sessions/${state.activeSessionId}/gitnexus/tool`, {
+    const resp = await api(apiPathFor(getActiveSession(), '/gitnexus/tool'), {
       method: 'POST',
       body: JSON.stringify({ kind: 'callgraph', args: { limit: 300 } }),
     });
@@ -2789,7 +2918,7 @@ async function loadGitNexusProcesses() {
   const pane = $('#gitNexusPane');
   pane.innerHTML = '<div class="muted" style="padding:14px">读取执行流…</div>';
   try {
-    const resp = await api(`/api/sessions/${state.activeSessionId}/gitnexus/tool`, {
+    const resp = await api(apiPathFor(getActiveSession(), '/gitnexus/tool'), {
       method: 'POST',
       body: JSON.stringify({ kind: 'processes', args: { limit: 50 } }),
     });
@@ -2807,7 +2936,7 @@ async function runGitNexusImpact(symbol) {
   state.gitNexusImpact = { loading: true };
   renderGitNexusPane();
   try {
-    const resp = await api(`/api/sessions/${state.activeSessionId}/gitnexus/tool`, {
+    const resp = await api(apiPathFor(getActiveSession(), '/gitnexus/tool'), {
       method: 'POST',
       body: JSON.stringify({ kind: 'impact', symbol }),
     });
@@ -3054,7 +3183,7 @@ async function loadGitNexusHierarchy() {
   if (!state.gitNexusCallGraph) {
     pane.innerHTML = '<div class="muted" style="padding:14px">读取调用图（cypher）…</div>';
     try {
-      const resp = await api(`/api/sessions/${state.activeSessionId}/gitnexus/tool`, {
+      const resp = await api(apiPathFor(getActiveSession(), '/gitnexus/tool'), {
         method: 'POST',
         body: JSON.stringify({ kind: 'callgraph', args: { limit: 300 } }),
       });
@@ -3524,7 +3653,7 @@ async function openDepositDialog(turnId, { keepOpen = false } = {}) {
   $('#depositCommit').disabled = true;
   $('#depositRedistill').disabled = true;
   try {
-    const resp = await api(`/api/sessions/${state.activeSessionId}/turns/${turnId}/distill`, {
+    const resp = await api(apiPathFor(getActiveSession(), `/turns/${turnId}/distill`), {
       method: 'POST',
       body: JSON.stringify({ scope: 'workdir', includeExperiences: true, guidance }),
     });
@@ -3826,15 +3955,34 @@ async function restartTerminal() {
   attachTerminalToActiveSession();
 }
 
-function toggleTerminalFullscreen() {
-  const panel = $('#terminalPanel');
-  if (!panel) return;
-  const next = !panel.classList.contains('fullscreen');
-  panel.classList.toggle('fullscreen', next);
-  const btn = $('#terminalFullscreenBtn');
+function switchBottomTab(tab) {
+  if (tab === state.bottomTab) return;
+  state.bottomTab = tab;
+  const container = $('#bottomTabs');
+  if (!container) return;
+  container.setAttribute('data-active', tab);
+  $$('.bottom-tab-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.bottomTab === tab);
+  });
+  container.querySelectorAll('.bottom-tab-panel').forEach(p => {
+    if (p.dataset.panel === tab) {
+      p.classList.remove('bottom-tab-panel-hidden');
+    } else {
+      p.classList.add('bottom-tab-panel-hidden');
+    }
+  });
+  if (tab === 'terminal') {
+    setTimeout(() => { try { state.terminal?.fit?.fit(); } catch {} }, 30);
+  }
+}
+
+function toggleBottomFullscreen() {
+  const container = $('#bottomTabs');
+  if (!container) return;
+  const next = !container.classList.contains('fullscreen');
+  container.classList.toggle('fullscreen', next);
+  const btn = $('#bottomFullscreenBtn');
   if (btn) btn.textContent = next ? '⛶ 退出全屏' : '⛶ 全屏';
-  // Refit xterm after the layout change so cols/rows reflect the new size.
-  // ResizeObserver also fires, but a direct fit avoids a one-frame mismatch.
   setTimeout(() => {
     try { state.terminal?.fit?.fit(); } catch {}
   }, 30);

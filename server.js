@@ -12,8 +12,6 @@ import { MemoryStore } from './src/memoryStore.js';
 import { DeciderQueue } from './src/deciderQueue.js';
 import { PRESET_POLICIES, getPolicy } from './src/policyEngine.js';
 import { scanStructure, annotateChanges } from './src/structure.js';
-import { buildDesignGraph } from './src/designGraph.js';
-import { buildCodeMap } from './src/codeMap.js';
 import * as gitnexus from './src/gitnexus.js';
 import { extractHabits } from './src/habitExtractor.js';
 import { distillExperiences } from './src/memoryDistiller.js';
@@ -21,6 +19,7 @@ import { mergeHabit, mergeExperience, hashWorkdir } from './src/memoryEngine.js'
 import { relevantForPrompt } from './src/memoryRetriever.js';
 import { TerminalManager } from './src/terminalManager.js';
 import { GOAL_PROMPT_PATHS } from './src/goalRunner.js';
+import { PeerManager } from './src/peerManager.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -44,6 +43,30 @@ for (const persisted of store.loadAll()) {
 const sseClients = new Set();
 
 const terminals = new TerminalManager({ broadcast });
+
+// ===== Peer discovery =====
+const peerManager = new PeerManager({ httpPort: PORT });
+peerManager.start();
+
+peerManager.on('peer:added', (peer) => {
+  broadcast('peer:added', peer);
+  peerManager.openBridge(peer.id, handleRemoteEvent);
+});
+peerManager.on('peer:removed', (peer) => {
+  broadcast('peer:removed', peer);
+});
+
+function handleRemoteEvent(peerId, eventType, data) {
+  const mapped = {
+    'session:created': 'remote:session:created',
+    'session:updated': 'remote:session:updated',
+    'session:removed': 'remote:session:removed',
+    'event': 'remote:event',
+  };
+  const outType = mapped[eventType];
+  if (!outType) return;
+  broadcast(outType, { peerId, ...data });
+}
 
 manager.on('session:event', (payload) => broadcast('event', payload));
 manager.on('session:updated', (payload) => broadcast('session:updated', payload));
@@ -141,6 +164,31 @@ const server = http.createServer(async (req, res) => {
         globalContent: readSafe(GOAL_PROMPT_PATHS.global),
         projectContent: readSafe(projectPath),
       });
+    }
+
+    // ===== Peer routes =====
+    if (pathname === '/api/peers' && req.method === 'GET') {
+      return json(res, 200, {
+        peers: peerManager.getPeers(),
+        instanceId: peerManager.instanceId,
+        lanMode: peerManager.isActive(),
+      });
+    }
+
+    // ===== Remote proxy routes =====
+    const remoteMatch = pathname.match(/^\/api\/remote\/([^/]+)(\/.*)?$/);
+    if (remoteMatch) {
+      const peerId = remoteMatch[1];
+      const remotePath = '/api' + (remoteMatch[2] || '');
+      try {
+        const body = req.method !== 'GET' ? await readJson(req).catch(() => ({})) : null;
+        const result = await peerManager.proxyRequest(peerId, req.method, remotePath, body);
+        res.writeHead(result.status, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(result.body);
+      } catch (e) {
+        return json(res, 502, { error: e.message });
+      }
+      return;
     }
 
     if (pathname === '/api/sessions' && req.method === 'GET')
@@ -318,6 +366,7 @@ const server = http.createServer(async (req, res) => {
 
       if (rest === '/code-map' && req.method === 'GET') {
         try {
+          const { buildCodeMap } = await import('./src/codeMap.js');
           const map = buildCodeMap(session.workdir);
           // Annotate symbols with last-change info using session.lastChangeMap
           const changeMap = session.lastChangeMap || {};
@@ -338,6 +387,7 @@ const server = http.createServer(async (req, res) => {
       if (rest === '/design-graph' && req.method === 'GET') {
         const type = parsed.query.type || 'modules';
         try {
+          const { buildDesignGraph } = await import('./src/designGraph.js');
           const graph = await buildDesignGraph(session.workdir, { type });
           // Annotate changed nodes
           const changeMap = session.lastChangeMap || {};
@@ -511,17 +561,22 @@ function readJson(req) {
 }
 
 server.listen(PORT, () => {
-  // eslint-disable-next-line no-console
   console.log(`Claude Code Console running at http://localhost:${PORT}`);
   console.log(`Working directory: ${process.cwd()}`);
   console.log(`Session data dir: ${DATA_DIR}`);
   console.log(`Memory file: ${MEMORY_FILE}`);
+  if (peerManager.isActive()) {
+    console.log(`LAN discovery active, instance: ${peerManager.instanceId}`);
+  } else {
+    console.log('LAN discovery disabled (no 192.168.x.x interface)');
+  }
 });
 
 let shuttingDown = false;
 function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
+  try { peerManager.stop(); } catch {}
   try { deciderQueue.abortAll(); } catch {}
   for (const s of manager.sessions.values()) {
     try { s.cancel(); } catch {}
