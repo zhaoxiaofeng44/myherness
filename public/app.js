@@ -442,9 +442,22 @@ function populatePolicySelectors() {
 
 function connectEvents() {
   const es = new EventSource('/api/events');
+  let hadConnection = false;
+  let reconcileTimer = null;
+  function scheduleReconcile() {
+    if (reconcileTimer) return;
+    reconcileTimer = setTimeout(() => {
+      reconcileTimer = null;
+      refreshSessions();
+    }, 500);
+  }
   es.addEventListener('open', () => ($('#connStatus').textContent = '已连接'));
   es.addEventListener('error', () => ($('#connStatus').textContent = '连接断开（重试中）'));
-  es.addEventListener('hello', () => ($('#connStatus').textContent = '已连接'));
+  es.addEventListener('hello', () => {
+    $('#connStatus').textContent = '已连接';
+    if (hadConnection) refreshSessions();
+    hadConnection = true;
+  });
   es.addEventListener('session:created', () => refreshSessions());
   es.addEventListener('session:removed', () => refreshSessions());
   es.addEventListener('session:updated', (e) => {
@@ -460,8 +473,12 @@ function connectEvents() {
   });
   es.addEventListener('event', (e) => {
     const data = JSON.parse(e.data);
+    const evt = data.event;
+    if (evt && (evt.type === 'turn:end' || evt.type === 'goal:done' || evt.type === 'goal:failed' || evt.type === 'goal:aborted')) {
+      scheduleReconcile();
+    }
     if (data.sessionId !== state.activeSessionId) return;
-    handleSessionEvent(data.event);
+    handleSessionEvent(evt);
   });
   es.addEventListener('gitnexus:start', (e) => {
     const data = JSON.parse(e.data);

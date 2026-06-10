@@ -338,12 +338,20 @@ class Session {
       stderrBuf += chunk.toString('utf8');
     });
 
+    let turnFinished = false;
     child.on('error', (err) => {
       this._record({ type: 'turn:error', turnId, error: err.message });
-      this._endTurn('error', err.message);
+      setTimeout(() => {
+        if (!turnFinished) {
+          turnFinished = true;
+          this._afterTurnFinish('error');
+        }
+      }, 3000);
     });
 
     child.on('close', (code, signal) => {
+      if (turnFinished) return;
+      turnFinished = true;
       if (this._killEscalateTimer) {
         clearTimeout(this._killEscalateTimer);
         this._killEscalateTimer = null;
@@ -876,65 +884,70 @@ class Session {
     this.activeChild = null;
 
     // Compute file changes for the turn.
-    const changedFiles = this.changeTracker.diff();
-    if (changedFiles.length > 0 && turn) {
-      const MAX_DIFF_LINES = 5000;
-      const MAX_DIFF_LINE_CHARS = 2000;
-      const enriched = changedFiles.map((c) => {
-        let beforeContent = this.fileBaselines[c.relPath] ?? null;
-        let afterContent = null;
-        if (c.kind !== 'deleted') {
-          const r = this.changeTracker.readFile(c.relPath);
-          afterContent = r.content;
-        }
-        let diffLines = null;
-        let diffTruncated = false;
-        if (beforeContent != null || afterContent != null) {
-          const raw = this.changeTracker.unifiedDiff(c.relPath, beforeContent || '', afterContent || '');
-          if (raw.length > MAX_DIFF_LINES) {
-            diffLines = raw.slice(0, MAX_DIFF_LINES);
-            diffTruncated = true;
-          } else {
-            diffLines = raw;
+    // Wrapped in try-catch: diff failures must never block status broadcast.
+    try {
+      const changedFiles = this.changeTracker.diff();
+      if (changedFiles.length > 0 && turn) {
+        const MAX_DIFF_LINES = 5000;
+        const MAX_DIFF_LINE_CHARS = 2000;
+        const enriched = changedFiles.map((c) => {
+          let beforeContent = this.fileBaselines[c.relPath] ?? null;
+          let afterContent = null;
+          if (c.kind !== 'deleted') {
+            try {
+              const r = this.changeTracker.readFile(c.relPath);
+              afterContent = r.content;
+            } catch {}
           }
-          // Cap individual line length so a single very long line can't blow up the payload.
-          for (const ln of diffLines) {
-            if (typeof ln.text === 'string' && ln.text.length > MAX_DIFF_LINE_CHARS) {
-              ln.text = ln.text.slice(0, MAX_DIFF_LINE_CHARS) + '… (truncated)';
+          let diffLines = null;
+          let diffTruncated = false;
+          if (beforeContent != null || afterContent != null) {
+            const raw = this.changeTracker.unifiedDiff(c.relPath, beforeContent || '', afterContent || '');
+            if (raw.length > MAX_DIFF_LINES) {
+              diffLines = raw.slice(0, MAX_DIFF_LINES);
               diffTruncated = true;
+            } else {
+              diffLines = raw;
+            }
+            for (const ln of diffLines) {
+              if (typeof ln.text === 'string' && ln.text.length > MAX_DIFF_LINE_CHARS) {
+                ln.text = ln.text.slice(0, MAX_DIFF_LINE_CHARS) + '… (truncated)';
+                diffTruncated = true;
+              }
             }
           }
-        }
-        // Update baseline for next turn.
-        if (afterContent != null) this.fileBaselines[c.relPath] = afterContent;
-        else delete this.fileBaselines[c.relPath];
+          if (afterContent != null) this.fileBaselines[c.relPath] = afterContent;
+          else delete this.fileBaselines[c.relPath];
 
-        return {
-          relPath: c.relPath,
-          kind: c.kind,
-          size: c.size,
-          diff: diffLines,
-          diffTruncated: diffTruncated || undefined,
+          return {
+            relPath: c.relPath,
+            kind: c.kind,
+            size: c.size,
+            diff: diffLines,
+            diffTruncated: diffTruncated || undefined,
+          };
+        });
+        const changeSet = {
+          turnId: turn.id,
+          timestamp: Date.now(),
+          files: enriched,
         };
-      });
-      const changeSet = {
-        turnId: turn.id,
-        timestamp: Date.now(),
-        files: enriched,
-      };
-      this.changes.push(changeSet);
-      for (const f of enriched) {
-        this.lastChangeMap[f.relPath] = { turnId: turn.id, kind: f.kind };
+        this.changes.push(changeSet);
+        for (const f of enriched) {
+          this.lastChangeMap[f.relPath] = { turnId: turn.id, kind: f.kind };
+        }
+        this._record({ type: 'turn:changes', turnId: turn.id, files: enriched });
+      } else if (turn) {
+        this._record({ type: 'turn:changes', turnId: turn.id, files: [] });
       }
-      this._record({ type: 'turn:changes', turnId: turn.id, files: enriched });
-    } else if (turn) {
-      this._record({ type: 'turn:changes', turnId: turn.id, files: [] });
+    } catch (e) {
+      if (turn) this._record({ type: 'turn:changes', turnId: turn.id, files: [], error: e.message });
     }
 
     if (turn) this._record({ type: 'turn:end', turnId: turn.id, status: turn.status });
 
     if (turn && this._deciderQueue) {
-      this._deciderQueue.resetTurn(this.id, turn.id);
+      try { this._deciderQueue.resetTurn(this.id, turn.id); } catch {}
     }
 
     this.activeTurn = null;
