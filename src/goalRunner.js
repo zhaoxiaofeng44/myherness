@@ -250,6 +250,7 @@ export class GoalRunner {
     }
     this._detachListener();
     this._record('goal:aborted', { reason });
+    this._broadcast();
   }
 
   // Make sure the project's .claude-goal/ exists and clear out stale per-task

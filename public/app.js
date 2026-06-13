@@ -46,8 +46,15 @@ const state = {
   suggestExpanded: false, // 相关经验默认折叠，点击标题展开
   suggestDebounce: null,
   expandedHeads: new Set(), // chain heads whose history list is expanded
+  collapsedGroups: new Set(), // collapsed group keys ('local' or peerId)
+  newSessionTargetPeer: null, // null = local, { id, name } = remote peer
   pendingPromptDraft: null, // { sessionId, text } — applied once active session matches
   approvalRenderSig: null,  // signature of last-rendered approval pane (id:deciderState|...)
+  detailCache: new Map(),   // sessionId -> { detail, accessedAt }
+  // ===== Settings profiles =====
+  settingsProfiles: [],
+  activeProfileId: null,
+  editingProfileId: null, // id of profile being edited, or 'new' for create
   // ===== Remote peers =====
   peers: [],          // [{ id, name, host, httpPort }]
   lanMode: false,
@@ -71,7 +78,8 @@ function escapeHtml(s) {
   return String(s ?? '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 function truncate(s, n = 200) {
   if (!s) return '';
@@ -323,7 +331,7 @@ function renderPeerStatus() {
 
 // ===== Initial bootstrap =====
 async function init() {
-  $('#newSessionBtn').addEventListener('click', openNewSessionDialog);
+  $('#newSessionBtn').addEventListener('click', () => openNewSessionDialog());
   $('#dlgCancel').addEventListener('click', () => $('#newSessionDialog').close());
   $('#newSessionForm').addEventListener('submit', submitNewSession);
   $('#promptForm').addEventListener('submit', submitPrompt);
@@ -465,6 +473,8 @@ function connectEvents() {
     const idx = state.sessions.findIndex((s) => s.id === data.id);
     if (idx >= 0) state.sessions[idx] = data;
     else state.sessions.unshift(data);
+    const cached = state.detailCache.get(data.id);
+    if (cached) cached.detail.session = data;
     if (data.id === state.activeSessionId && state.detail) {
       state.detail.session = data;
       renderTopbar();
@@ -477,7 +487,11 @@ function connectEvents() {
     if (evt && (evt.type === 'turn:end' || evt.type === 'goal:done' || evt.type === 'goal:failed' || evt.type === 'goal:aborted')) {
       scheduleReconcile();
     }
-    if (data.sessionId !== state.activeSessionId) return;
+    if (data.sessionId !== state.activeSessionId) {
+      const cached = state.detailCache.get(data.sessionId);
+      if (cached && evt) cached.detail.events.push(evt);
+      return;
+    }
     handleSessionEvent(evt);
   });
   es.addEventListener('gitnexus:start', (e) => {
@@ -563,12 +577,18 @@ async function refreshSessions() {
 
 async function deleteSession(id) {
   const target = state.sessions.find((s) => s.id === id);
-  const label = target ? `${target.name}（${target.id}）` : id;
+  const remoteTarget = !target ? state.remoteSessions.find((s) => s.id === id) : null;
+  const sess = target || remoteTarget;
+  const label = sess ? `${sess.name}（${sess.id}）` : id;
   if (!confirm(`确定删除会话 ${label} 吗？\n\n同一目录下的所有历史会话都会一并清除（运行进程终止、事件 / 终端 / 持久化记录都会删除，不可撤销）。`)) {
     return;
   }
   try {
-    await api(`/api/sessions/${id}`, { method: 'DELETE' });
+    if (remoteTarget && remoteTarget._peerId) {
+      await api(`/api/remote/${remoteTarget._peerId}/sessions/${id}`, { method: 'DELETE' });
+    } else {
+      await api(`/api/sessions/${id}`, { method: 'DELETE' });
+    }
   } catch (e) {
     alert('删除失败：' + e.message);
     return;
@@ -577,9 +597,12 @@ async function deleteSession(id) {
     state.activeSessionId = null;
     state.detail = null;
   }
-  // SSE `session:removed` will refresh the list; do an immediate refresh too
-  // in case the event hasn't arrived yet (avoids a flicker showing the deleted row).
-  await refreshSessions();
+  state.detailCache.delete(id);
+  if (remoteTarget) {
+    await refreshPeers();
+  } else {
+    await refreshSessions();
+  }
   renderAll();
 }
 
@@ -592,48 +615,58 @@ function renderSessionList() {
     return;
   }
 
-  // A "head" is a session that no other session points to via parentSessionId.
-  // History walks parentSessionId backwards from the head until null/missing.
-  const sessionMap = new Map(allLocal.map((s) => [s.id, s]));
-  const isParentOf = new Set();
-  for (const s of allLocal) {
-    if (s.parentSessionId && sessionMap.has(s.parentSessionId)) {
-      isParentOf.add(s.parentSessionId);
+  function buildHeadsAndHistory(sessions) {
+    const sessionMap = new Map(sessions.map((s) => [s.id, s]));
+    const isParentOf = new Set();
+    for (const s of sessions) {
+      if (s.parentSessionId && sessionMap.has(s.parentSessionId)) {
+        isParentOf.add(s.parentSessionId);
+      }
     }
-  }
-  const heads = allLocal
-    .filter((s) => !isParentOf.has(s.id))
-    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    const heads = sessions
+      .filter((s) => !isParentOf.has(s.id))
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
 
-  function buildHistory(headId) {
-    const out = [];
-    let cur = sessionMap.get(headId);
-    const seen = new Set([headId]);
-    while (cur && cur.parentSessionId && !seen.has(cur.parentSessionId)) {
-      const p = sessionMap.get(cur.parentSessionId);
-      if (!p) break;
-      out.push(p);
-      seen.add(p.id);
-      cur = p;
+    function buildHistory(headId) {
+      const out = [];
+      let cur = sessionMap.get(headId);
+      const seen = new Set([headId]);
+      while (cur && cur.parentSessionId && !seen.has(cur.parentSessionId)) {
+        const p = sessionMap.get(cur.parentSessionId);
+        if (!p) break;
+        out.push(p);
+        seen.add(p.id);
+        cur = p;
+      }
+      return out;
     }
-    return out;
+
+    return { heads, buildHistory };
   }
 
   const blocks = [];
+  const localCollapsed = state.collapsedGroups.has('local');
 
-  if (allLocal.length > 0) {
-    blocks.push('<li class="si-group-label">本机</li>');
+  // Local group header
+  if (allLocal.length > 0 || allRemote.length > 0) {
+    blocks.push(`<li class="si-group-label si-group-collapsible" data-group="local">
+      <span class="si-group-caret">${localCollapsed ? '▸' : '▾'}</span> 本机
+    </li>`);
   }
+
+  const { heads, buildHistory } = buildHeadsAndHistory(allLocal);
   for (const head of heads) {
     const history = buildHistory(head.id);
     const expanded = state.expandedHeads.has(head.id);
+    const groupHidden = localCollapsed ? ' hidden' : '';
     blocks.push(renderSessionItem(head, {
       isHead: true,
       historyCount: history.length,
       expanded,
+      extraHidden: groupHidden,
     }));
     if (history.length > 0) {
-      const hidden = expanded ? '' : ' hidden';
+      const hidden = (expanded && !localCollapsed) ? '' : ' hidden';
       for (const h of history) {
         blocks.push(renderSessionItem(h, {
           isHead: false,
@@ -653,10 +686,34 @@ function renderSessionList() {
   }
   for (const [peerId, sessions] of byPeer) {
     const peerName = sessions[0]?._peerName || peerId;
-    blocks.push(`<li class="si-group-label remote-group-label">${escapeHtml(peerName)}</li>`);
-    const sorted = sessions.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-    for (const rs of sorted) {
-      blocks.push(renderSessionItem(rs, { isHead: true, isRemote: true }));
+    const peerCollapsed = state.collapsedGroups.has(peerId);
+    blocks.push(`<li class="si-group-label remote-group-label si-group-collapsible" data-group="${escapeHtml(peerId)}">
+      <span class="si-group-caret">${peerCollapsed ? '▸' : '▾'}</span> ${escapeHtml(peerName)}
+      <button class="si-group-add" data-peer-id="${escapeHtml(peerId)}" data-peer-name="${escapeHtml(peerName)}" title="在此设备上新建会话">＋</button>
+    </li>`);
+    const { heads: rHeads, buildHistory: rBuildHistory } = buildHeadsAndHistory(sessions);
+    for (const head of rHeads) {
+      const history = rBuildHistory(head.id);
+      const expanded = state.expandedHeads.has(head.id);
+      const groupHidden = peerCollapsed ? ' hidden' : '';
+      blocks.push(renderSessionItem(head, {
+        isHead: true,
+        historyCount: history.length,
+        expanded,
+        isRemote: true,
+        extraHidden: groupHidden,
+      }));
+      if (history.length > 0) {
+        const hidden = (expanded && !peerCollapsed) ? '' : ' hidden';
+        for (const h of history) {
+          blocks.push(renderSessionItem(h, {
+            isHead: false,
+            headId: head.id,
+            hidden,
+            isRemote: true,
+          }));
+        }
+      }
     }
   }
 
@@ -684,15 +741,33 @@ function renderSessionList() {
       deleteSession(btn.dataset.del);
     });
   });
+  $$('.si-group-collapsible').forEach((el) => {
+    el.addEventListener('click', (ev) => {
+      if (ev.target.closest('.si-group-add')) return;
+      const group = el.dataset.group;
+      if (state.collapsedGroups.has(group)) state.collapsedGroups.delete(group);
+      else state.collapsedGroups.add(group);
+      renderSessionList();
+    });
+  });
+  $$('.si-group-add').forEach((btn) => {
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      openNewSessionDialog({ peerId: btn.dataset.peerId, peerName: btn.dataset.peerName });
+    });
+  });
 }
 
 function renderSessionItem(s, opts) {
-  const { isHead, historyCount = 0, expanded = false, headId, hidden = '', isRemote = false } = opts;
+  const { isHead, historyCount = 0, expanded = false, headId, hidden = '', isRemote = false, extraHidden = '' } = opts;
   const classes = ['session-item'];
   if (s.id === state.activeSessionId) classes.push('active');
   if (!isHead) classes.push('history');
   if (isRemote) classes.push('remote');
   const status = renderStatusBadge(s.status);
+  const goalTag = s.goal
+    ? `<span class="status-pill ${s.goal.active ? 'running' : (s.goal.status === 'done' ? 'idle' : 'error')}" style="font-size:10px;margin-left:2px">${escapeHtml(s.goal.active ? s.goal.phaseLabel || s.goal.phase : (s.goal.status === 'done' ? '已完成' : s.goal.status === 'aborted' ? '已取消' : '已停止'))}</span>`
+    : '';
   const toggle =
     isHead && historyCount > 0
       ? `<button class="si-toggle" data-head="${s.id}" title="${expanded ? '收起' : '展开'}历史">
@@ -701,12 +776,13 @@ function renderSessionItem(s, opts) {
         </button>`
       : '';
   const headAttr = !isHead && headId ? ` data-history-of="${headId}"` : '';
+  const combinedHidden = hidden || extraHidden;
   return `
-    <li class="${classes.join(' ')}${hidden}" data-id="${s.id}"${headAttr}>
+    <li class="${classes.join(' ')}${combinedHidden}" data-id="${s.id}"${headAttr}>
       <div class="si-name">
         ${toggle}
-        <span class="si-name-text">${escapeHtml(s.name)}</span>${status}
-        ${isRemote ? '' : `<button class="si-delete" data-del="${s.id}" title="删除会话">×</button>`}
+        <span class="si-name-text">${escapeHtml(s.name)}</span>${status}${goalTag}
+        <button class="si-delete" data-del="${s.id}" title="删除会话">×</button>
       </div>
       <div class="si-meta">${escapeHtml(s.workdir)}</div>
     </li>`;
@@ -725,8 +801,18 @@ function renderStatusBadge(status) {
 }
 
 // ===== Sessions =====
-function openNewSessionDialog() {
-  $('#dlgWorkdir').value = state.cwd;
+function openNewSessionDialog(opts = {}) {
+  state.newSessionTargetPeer = opts.peerId ? { id: opts.peerId, name: opts.peerName || opts.peerId } : null;
+  const dlgTitle = $('#newSessionDialog').querySelector('h3');
+  if (state.newSessionTargetPeer) {
+    dlgTitle.textContent = `在 ${state.newSessionTargetPeer.name} 上新建会话`;
+    $('#dlgWorkdir').value = '';
+    $('#dlgWorkdir').placeholder = '远端机器的绝对路径';
+  } else {
+    dlgTitle.textContent = '新建 Claude Code 会话';
+    $('#dlgWorkdir').value = state.cwd;
+    $('#dlgWorkdir').placeholder = '/absolute/path';
+  }
   $('#dlgPolicy').value = 'balanced';
   $('#dlgName').value = '';
   $('#newSessionDialog').showModal();
@@ -739,10 +825,17 @@ async function submitNewSession(e) {
     policyId: $('#dlgPolicy').value,
   };
   try {
-    const resp = await api('/api/sessions', { method: 'POST', body: JSON.stringify(body) });
+    const apiPath = state.newSessionTargetPeer
+      ? `/api/remote/${state.newSessionTargetPeer.id}/sessions`
+      : '/api/sessions';
+    const resp = await api(apiPath, { method: 'POST', body: JSON.stringify(body) });
     $('#newSessionDialog').close();
-    await refreshSessions();
-    selectSession(resp.session.id);
+    if (state.newSessionTargetPeer) {
+      await refreshPeers();
+    } else {
+      await refreshSessions();
+      selectSession(resp.session.id);
+    }
   } catch (err) {
     alert('创建会话失败：' + err.message);
   }
@@ -771,8 +864,21 @@ async function selectSession(id) {
   state.gitNexusHierarchySelected = null;
   state.gitNexusHierarchyHover = null;
   state.approvalRenderSig = null;
-  await loadDetail();
+
+  const cached = state.detailCache.get(id);
+  if (cached) {
+    state.detail = cached.detail;
+    cached.accessedAt = Date.now();
+    renderSessionList();
+    renderAll();
+    loadDetail(true);
+    return;
+  }
+
+  state.detail = null;
   renderSessionList();
+  renderAll();
+  await loadDetail();
   renderAll();
 }
 
@@ -786,20 +892,43 @@ function getActiveSession() {
   return state.detail?.session || findSession(state.activeSessionId);
 }
 
-async function loadDetail() {
+async function loadDetail(background = false) {
   if (!state.activeSessionId) {
     state.detail = null;
     return;
   }
-  const sess = findSession(state.activeSessionId);
-  if (sess && sess._peerId) {
-    state.detail = await api(`/api/remote/${sess._peerId}/sessions/${state.activeSessionId}`);
-    state.detail.session._peerId = sess._peerId;
-    state.detail.session._peerName = sess._peerName;
-  } else {
-    state.detail = await api(`/api/sessions/${state.activeSessionId}`);
+  const id = state.activeSessionId;
+  let detail;
+  const sess = findSession(id);
+  try {
+    if (sess && sess._peerId) {
+      detail = await api(`/api/remote/${sess._peerId}/sessions/${id}`);
+      detail.session._peerId = sess._peerId;
+      detail.session._peerName = sess._peerName;
+    } else {
+      detail = await api(`/api/sessions/${id}`);
+    }
+  } catch {
+    return;
   }
-  $('#policySelect').value = state.detail.session.policyId;
+  if (state.activeSessionId !== id) return;
+
+  state.detail = detail;
+  evictDetailCache();
+  state.detailCache.set(id, { detail, accessedAt: Date.now() });
+  $('#policySelect').value = detail.session.policyId;
+  if (background) renderAll();
+}
+
+const DETAIL_CACHE_MAX = 10;
+function evictDetailCache() {
+  if (state.detailCache.size <= DETAIL_CACHE_MAX) return;
+  let oldest = null;
+  for (const [k, v] of state.detailCache) {
+    if (k === state.activeSessionId) continue;
+    if (!oldest || v.accessedAt < oldest.accessedAt) oldest = { key: k, ...v };
+  }
+  if (oldest) state.detailCache.delete(oldest.key);
 }
 
 function handleSessionEvent(evt) {
@@ -926,6 +1055,9 @@ function renderViewIfActive() {
   else if (state.view === 'memory') {
     if (!state.memory) loadMemory();
     else renderMemoryView();
+  } else if (state.view === 'settings') {
+    if (state.settingsProfiles.length === 0 && !state.editingProfileId) loadSettingsProfiles();
+    else if (!state.editingProfileId) renderSettingsView();
   }
 }
 
@@ -943,8 +1075,9 @@ function switchStructureTab(tab) {
 
 function renderTopbar() {
   if (!state.detail) {
-    $('#sessionTitle').textContent = '未选择会话';
-    $('#sessionMeta').textContent = '';
+    const sess = state.activeSessionId ? findSession(state.activeSessionId) : null;
+    $('#sessionTitle').textContent = sess ? sess.name : '未选择会话';
+    $('#sessionMeta').textContent = sess ? '加载中…' : '';
     $('#statusPill').textContent = '';
     $('#statusPill').className = 'status-pill';
     $('#cancelBtn').disabled = true;
@@ -1006,7 +1139,9 @@ function isPaneAtBottom(pane) {
 function renderChatView() {
   const pane = $('#chatPane');
   if (!state.detail) {
-    pane.innerHTML = '<div class="empty">选择或创建一个会话以开始</div>';
+    pane.innerHTML = state.activeSessionId
+      ? '<div class="empty">加载中…</div>'
+      : '<div class="empty">选择或创建一个会话以开始</div>';
     $('#approvalPane').innerHTML = '';
     return;
   }
@@ -4010,6 +4145,190 @@ function renderTerminal() {
   const workdir = state.detail?.session?.workdir || '(未选择会话)';
   if (cwdEl) cwdEl.textContent = workdir;
   attachTerminalToActiveSession();
+}
+
+// ===== Settings profiles =====
+async function loadSettingsProfiles() {
+  try {
+    const resp = await api('/api/settings/profiles');
+    state.settingsProfiles = resp.profiles || [];
+    state.activeProfileId = (state.settingsProfiles.find((p) => p.isActive) || {}).id || null;
+  } catch (e) {
+    state.settingsProfiles = [];
+  }
+  renderSettingsView();
+}
+
+async function createSettingsProfile(name, content) {
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    alert('JSON 格式错误，请检查配置内容');
+    return;
+  }
+  try {
+    await api('/api/settings/profiles', {
+      method: 'POST',
+      body: JSON.stringify({ name, content: parsed }),
+    });
+    state.editingProfileId = null;
+    await loadSettingsProfiles();
+  } catch (e) {
+    alert('创建失败：' + e.message);
+  }
+}
+
+async function updateSettingsProfile(id, name, content) {
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    alert('JSON 格式错误，请检查配置内容');
+    return;
+  }
+  try {
+    await api(`/api/settings/profiles/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify({ name, content: parsed }),
+    });
+    state.editingProfileId = null;
+    await loadSettingsProfiles();
+  } catch (e) {
+    alert('更新失败：' + e.message);
+  }
+}
+
+async function deleteSettingsProfile(id) {
+  const p = state.settingsProfiles.find((x) => x.id === id);
+  const wasActive = p?.isActive;
+  if (!confirm(`确定删除配置方案「${p?.name || id}」吗？`)) return;
+  try {
+    await api(`/api/settings/profiles/${id}`, { method: 'DELETE' });
+    if (wasActive) {
+      alert('提示：已删除的配置方案此前处于激活状态，~/.claude/settings.json 中仍保留其内容。如需更新，请激活另一个配置方案。');
+    }
+    await loadSettingsProfiles();
+  } catch (e) {
+    alert('删除失败：' + e.message);
+  }
+}
+
+async function activateSettingsProfile(id) {
+  try {
+    await api(`/api/settings/profiles/${id}/activate`, { method: 'POST' });
+    await loadSettingsProfiles();
+  } catch (e) {
+    alert('激活失败：' + e.message);
+  }
+}
+
+function renderSettingsView() {
+  const container = $('#settingsView');
+  if (!container) return;
+
+  const profiles = state.settingsProfiles;
+  const editing = state.editingProfileId;
+
+  let html = '<div class="settings-header"><h3>Claude Settings 配置管理</h3>';
+  html += '<button class="primary-btn settings-new-btn" id="settingsNewBtn">＋ 新建配置</button></div>';
+
+  if (editing === 'new') {
+    html += renderSettingsForm(null);
+  }
+
+  if (profiles.length === 0 && editing !== 'new') {
+    html += '<div class="muted" style="padding:16px 0">还没有配置方案，点击上方按钮创建。</div>';
+  }
+
+  for (const p of profiles) {
+    if (editing === p.id) {
+      html += renderSettingsForm(p);
+    } else {
+      const activeClass = p.isActive ? ' settings-card-active' : '';
+      html += `<div class="settings-card${activeClass}" data-profile-id="${p.id}">
+        <div class="settings-card-header">
+          <span class="settings-card-name">${escapeHtml(p.name)}</span>
+          ${p.isActive ? '<span class="settings-active-badge">当前激活</span>' : ''}
+          <span class="settings-card-actions">
+            ${p.isActive ? '' : `<button class="ghost-btn settings-activate-btn" data-pid="${p.id}">激活</button>`}
+            <button class="ghost-btn settings-edit-btn" data-pid="${p.id}">编辑</button>
+            <button class="ghost-btn settings-delete-btn" data-pid="${p.id}">删除</button>
+          </span>
+        </div>
+        <pre class="settings-card-content">${escapeHtml(JSON.stringify(p.content, null, 2))}</pre>
+        <div class="settings-card-meta">${fmtDateTime(p.updatedAt)}</div>
+      </div>`;
+    }
+  }
+
+  container.innerHTML = html;
+
+  const newBtn = $('#settingsNewBtn');
+  if (newBtn) {
+    newBtn.addEventListener('click', () => {
+      state.editingProfileId = 'new';
+      renderSettingsView();
+    });
+  }
+  $$('.settings-activate-btn').forEach((btn) => {
+    btn.addEventListener('click', () => activateSettingsProfile(btn.dataset.pid));
+  });
+  $$('.settings-edit-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      state.editingProfileId = btn.dataset.pid;
+      renderSettingsView();
+    });
+  });
+  $$('.settings-delete-btn').forEach((btn) => {
+    btn.addEventListener('click', () => deleteSettingsProfile(btn.dataset.pid));
+  });
+  const form = $('#settingsProfileForm');
+  if (form) {
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const name = $('#spfName').value.trim();
+      const content = $('#spfContent').value.trim();
+      if (!name) { alert('请输入名称'); return; }
+      if (editing === 'new') createSettingsProfile(name, content);
+      else updateSettingsProfile(editing, name, content);
+    });
+    $('#spfCancel')?.addEventListener('click', () => {
+      state.editingProfileId = null;
+      renderSettingsView();
+    });
+    $('#spfImportCurrent')?.addEventListener('click', async () => {
+      try {
+        const resp = await api('/api/settings/current');
+        if (resp.content) {
+          $('#spfContent').value = JSON.stringify(resp.content, null, 2);
+        } else {
+          alert('未找到当前 ~/.claude/settings.json');
+        }
+      } catch (e) {
+        alert('读取失败：' + e.message);
+      }
+    });
+  }
+}
+
+function renderSettingsForm(profile) {
+  const name = profile ? escapeHtml(profile.name) : '';
+  const content = profile ? escapeHtml(JSON.stringify(profile.content, null, 2)) : '{\n  \n}';
+  const title = profile ? '编辑配置方案' : '新建配置方案';
+  return `<form class="settings-form" id="settingsProfileForm">
+    <h4>${title}</h4>
+    <label>名称 <input id="spfName" value="${name}" required placeholder="如：高性能模式" /></label>
+    <label>配置内容 (JSON)
+      <textarea id="spfContent" rows="10" required placeholder='{"permissions":...}'>${content}</textarea>
+    </label>
+    <div class="settings-form-actions">
+      <button type="button" id="spfImportCurrent" class="ghost-btn">导入当前配置</button>
+      <span class="settings-form-spacer"></span>
+      <button type="button" id="spfCancel" class="ghost-btn">取消</button>
+      <button type="submit" class="primary-btn">保存</button>
+    </div>
+  </form>`;
 }
 
 init().catch((err) => {

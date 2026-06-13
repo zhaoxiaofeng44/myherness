@@ -20,6 +20,7 @@ import { relevantForPrompt } from './src/memoryRetriever.js';
 import { TerminalManager } from './src/terminalManager.js';
 import { GOAL_PROMPT_PATHS } from './src/goalRunner.js';
 import { PeerManager } from './src/peerManager.js';
+import { SettingsProfileStore } from './src/settingsProfiles.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -28,9 +29,12 @@ const PORT = parseInt(process.env.PORT || '4477', 10);
 const DATA_DIR =
   process.env.CLAUDE_CONSOLE_DATA || path.join(__dirname, '.claude-console', 'sessions');
 const MEMORY_FILE = path.join(path.dirname(DATA_DIR), 'memory.json');
+const SETTINGS_FILE = path.join(path.dirname(DATA_DIR), 'settings-profiles.json');
 const store = new SessionStore({ dir: DATA_DIR });
 const memoryStore = new MemoryStore({ file: MEMORY_FILE });
 memoryStore.load();
+const settingsProfileStore = new SettingsProfileStore({ file: SETTINGS_FILE });
+settingsProfileStore.load();
 const deciderQueue = new DeciderQueue();
 const manager = new SessionManager({ store, memoryStore, deciderQueue });
 for (const persisted of store.loadAll()) {
@@ -285,6 +289,52 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: true });
       }
       return json(res, 405, { error: 'method not allowed' });
+    }
+
+    // ===== Settings profiles routes =====
+    if (pathname === '/api/settings/profiles' && req.method === 'GET') {
+      return json(res, 200, { profiles: settingsProfileStore.list() });
+    }
+    if (pathname === '/api/settings/profiles' && req.method === 'POST') {
+      const body = await readJson(req);
+      if (!body.name) return json(res, 400, { error: '名称不能为空' });
+      if (typeof body.content !== 'object' || body.content === null)
+        return json(res, 400, { error: 'content 必须是 JSON 对象' });
+      const profile = settingsProfileStore.create({ name: body.name, content: body.content });
+      return json(res, 201, { profile });
+    }
+    if (pathname === '/api/settings/current' && req.method === 'GET') {
+      const content = settingsProfileStore.readCurrentSettings();
+      return json(res, 200, { content });
+    }
+    const settingsMatch = pathname.match(/^\/api\/settings\/profiles\/([^/]+)(\/.*)?$/);
+    if (settingsMatch) {
+      const id = settingsMatch[1];
+      const rest = settingsMatch[2] || '';
+      const profile = settingsProfileStore.get(id);
+      if (!profile) return json(res, 404, { error: '配置方案不存在' });
+      if (rest === '' || rest === '/') {
+        if (req.method === 'GET') {
+          return json(res, 200, { profile });
+        }
+        if (req.method === 'PUT') {
+          const body = await readJson(req);
+          if (body.content !== undefined && (typeof body.content !== 'object' || body.content === null))
+            return json(res, 400, { error: 'content 必须是 JSON 对象' });
+          const updated = settingsProfileStore.update(id, body);
+          return json(res, 200, { profile: updated });
+        }
+        if (req.method === 'DELETE') {
+          settingsProfileStore.remove(id);
+          return json(res, 200, { ok: true });
+        }
+        return json(res, 405, { error: 'method not allowed' });
+      }
+      if (rest === '/activate' && req.method === 'POST') {
+        const activated = settingsProfileStore.activate(id);
+        return json(res, 200, { profile: activated });
+      }
+      return json(res, 404, { error: '未知接口' });
     }
 
     if (pathname === '/api/events' && req.method === 'GET') {
@@ -585,6 +635,7 @@ function shutdown() {
   setImmediate(() => {
     try { store.flushAll(manager); } catch {}
     try { memoryStore.flush(); } catch {}
+    try { settingsProfileStore.flush(); } catch {}
     process.exit(0);
   });
 }
@@ -593,6 +644,7 @@ process.on('SIGTERM', shutdown);
 process.on('beforeExit', () => {
   try { store.flushAll(manager); } catch {}
   try { memoryStore.flush(); } catch {}
+  try { settingsProfileStore.flush(); } catch {}
 });
 
 // Last-resort safety net: surface unhandled errors instead of letting Node
