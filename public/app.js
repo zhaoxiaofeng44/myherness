@@ -46,6 +46,7 @@ const state = {
   suggestExpanded: false, // 相关经验默认折叠，点击标题展开
   suggestDebounce: null,
   expandedHeads: new Set(), // chain heads whose history list is expanded
+  expandedWorkdirs: new Set(), // 已展开的工作目录 key
   collapsedGroups: new Set(), // collapsed group keys ('local' or peerId)
   newSessionTargetPeer: null, // null = local, { id, name } = remote peer
   pendingPromptDraft: null, // { sessionId, text } — applied once active session matches
@@ -175,6 +176,41 @@ document.addEventListener('click', (e) => {
     return;
   }
 });
+
+// ===== Prompt draft persistence =====
+function savePromptDraft() {
+  try {
+    const txt = $('#promptInput')?.value || '';
+    if (state.activeSessionId) {
+      localStorage.setItem(`promptDraft_${state.activeSessionId}`, txt);
+    }
+  } catch (e) {
+    console.warn('Failed to save prompt draft:', e);
+  }
+}
+
+function restorePromptDraft() {
+  try {
+    if (state.activeSessionId) {
+      const draft = localStorage.getItem(`promptDraft_${state.activeSessionId}`);
+      if (draft && $('#promptInput')) {
+        $('#promptInput').value = draft;
+      }
+    }
+  } catch (e) {
+    console.warn('Failed to restore prompt draft:', e);
+  }
+}
+
+function clearPromptDraft() {
+  try {
+    if (state.activeSessionId) {
+      localStorage.removeItem(`promptDraft_${state.activeSessionId}`);
+    }
+  } catch (e) {
+    console.warn('Failed to clear prompt draft:', e);
+  }
+}
 
 // ===== Slash commands (autocomplete) =====
 const SLASH_COMMANDS = [
@@ -331,7 +367,6 @@ function renderPeerStatus() {
 
 // ===== Initial bootstrap =====
 async function init() {
-  $('#newSessionBtn').addEventListener('click', () => openNewSessionDialog());
   $('#dlgCancel').addEventListener('click', () => $('#newSessionDialog').close());
   $('#newSessionForm').addEventListener('submit', submitNewSession);
   $('#promptForm').addEventListener('submit', submitPrompt);
@@ -369,8 +404,12 @@ async function init() {
     renderAuditView();
   });
 
-  $$('.nav-btn').forEach((btn) => {
-    btn.addEventListener('click', () => switchView(btn.dataset.view));
+  // 绑定顶部会话视图标签页事件
+  $$('.session-view-tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      const viewName = tab.dataset.view;
+      switchView(viewName);
+    });
   });
 
   $('#depositCancel').addEventListener('click', () => $('#depositDialog').close());
@@ -423,6 +462,8 @@ async function init() {
   $('#promptInput').addEventListener('input', () => {
     updateSlashMenu();
     scheduleSuggestRelevant();
+    // 保存输入框内容到 localStorage
+    savePromptDraft();
   });
 
   // Load metadata
@@ -434,7 +475,34 @@ async function init() {
   state.policies = policiesResp.policies;
   populatePolicySelectors();
 
+  // 从 localStorage 恢复上次选中的会话ID（在 refreshSessions 之前）
+  try {
+    const savedSessionId = localStorage.getItem('activeSessionId');
+    if (savedSessionId) {
+      state.activeSessionId = savedSessionId; // 先设置，防止 refreshSessions 自动选择第一个
+    }
+  } catch (e) {
+    console.warn('Failed to restore session from localStorage:', e);
+  }
+
   await refreshSessions();
+
+  // 如果恢复的会话存在，加载详情和草稿
+  if (state.activeSessionId) {
+    const session = state.sessions.find(s => s.id === state.activeSessionId);
+    if (session) {
+      // 会话存在，加载详情
+      switchView('chat');
+      restorePromptDraft();
+      await loadDetail();
+      renderAll();
+    } else {
+      // 会话不存在（可能被删除），清除缓存
+      state.activeSessionId = null;
+      localStorage.removeItem('activeSessionId');
+    }
+  }
+
   connectEvents();
   renderPolicyView();
   refreshPeers();
@@ -607,77 +675,42 @@ async function deleteSession(id) {
 }
 
 function renderSessionList() {
-  const ul = $('#sessionList');
+  const navTree = $('#navTree');
   const allLocal = state.sessions;
   const allRemote = state.remoteSessions || [];
+
   if (allLocal.length === 0 && allRemote.length === 0) {
-    ul.innerHTML = '<li class="muted" style="padding:6px 10px;font-size:12px">还没有会话</li>';
+    navTree.innerHTML = '<li class="muted" style="padding:6px 10px;font-size:12px">还没有会话</li>';
     return;
   }
 
-  function buildHeadsAndHistory(sessions) {
-    const sessionMap = new Map(sessions.map((s) => [s.id, s]));
-    const isParentOf = new Set();
-    for (const s of sessions) {
-      if (s.parentSessionId && sessionMap.has(s.parentSessionId)) {
-        isParentOf.add(s.parentSessionId);
-      }
-    }
-    const heads = sessions
-      .filter((s) => !isParentOf.has(s.id))
-      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const devices = [];
 
-    function buildHistory(headId) {
-      const out = [];
-      let cur = sessionMap.get(headId);
-      const seen = new Set([headId]);
-      while (cur && cur.parentSessionId && !seen.has(cur.parentSessionId)) {
-        const p = sessionMap.get(cur.parentSessionId);
-        if (!p) break;
-        out.push(p);
-        seen.add(p.id);
-        cur = p;
-      }
-      return out;
-    }
-
-    return { heads, buildHistory };
+  // 本机设备 - 按工作目录分组
+  const localExpanded = !state.collapsedGroups.has('local');
+  const localByWorkdir = new Map();
+  for (const session of allLocal) {
+    const wd = session.workdir || '(未知)';
+    if (!localByWorkdir.has(wd)) localByWorkdir.set(wd, []);
+    localByWorkdir.get(wd).push(session);
   }
 
-  const blocks = [];
-  const localCollapsed = state.collapsedGroups.has('local');
+  devices.push({
+    id: 'local',
+    name: '💻 本机',
+    expanded: localExpanded,
+    workdirs: Array.from(localByWorkdir.entries()).map(([workdir, sessions]) => {
+      const wdKey = `workdir-${workdir}`;
+      return {
+        workdir,
+        sessions: sessions.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)), // 最新的在最上面
+        expanded: state.expandedWorkdirs.has(wdKey) // 根据 expandedWorkdirs 判断是否展开
+      };
+    }),
+    isLocal: true,
+  });
 
-  // Local group header
-  if (allLocal.length > 0 || allRemote.length > 0) {
-    blocks.push(`<li class="si-group-label si-group-collapsible" data-group="local">
-      <span class="si-group-caret">${localCollapsed ? '▸' : '▾'}</span> 本机
-    </li>`);
-  }
-
-  const { heads, buildHistory } = buildHeadsAndHistory(allLocal);
-  for (const head of heads) {
-    const history = buildHistory(head.id);
-    const expanded = state.expandedHeads.has(head.id);
-    const groupHidden = localCollapsed ? ' hidden' : '';
-    blocks.push(renderSessionItem(head, {
-      isHead: true,
-      historyCount: history.length,
-      expanded,
-      extraHidden: groupHidden,
-    }));
-    if (history.length > 0) {
-      const hidden = (expanded && !localCollapsed) ? '' : ' hidden';
-      for (const h of history) {
-        blocks.push(renderSessionItem(h, {
-          isHead: false,
-          headId: head.id,
-          hidden,
-        }));
-      }
-    }
-  }
-
-  // Remote sessions grouped by peer
+  // 远程设备 - 也按工作目录分组
   const byPeer = new Map();
   for (const rs of allRemote) {
     const key = rs._peerId;
@@ -686,61 +719,171 @@ function renderSessionList() {
   }
   for (const [peerId, sessions] of byPeer) {
     const peerName = sessions[0]?._peerName || peerId;
-    const peerCollapsed = state.collapsedGroups.has(peerId);
-    blocks.push(`<li class="si-group-label remote-group-label si-group-collapsible" data-group="${escapeHtml(peerId)}">
-      <span class="si-group-caret">${peerCollapsed ? '▸' : '▾'}</span> ${escapeHtml(peerName)}
-      <button class="si-group-add" data-peer-id="${escapeHtml(peerId)}" data-peer-name="${escapeHtml(peerName)}" title="在此设备上新建会话">＋</button>
-    </li>`);
-    const { heads: rHeads, buildHistory: rBuildHistory } = buildHeadsAndHistory(sessions);
-    for (const head of rHeads) {
-      const history = rBuildHistory(head.id);
-      const expanded = state.expandedHeads.has(head.id);
-      const groupHidden = peerCollapsed ? ' hidden' : '';
-      blocks.push(renderSessionItem(head, {
-        isHead: true,
-        historyCount: history.length,
-        expanded,
-        isRemote: true,
-        extraHidden: groupHidden,
-      }));
-      if (history.length > 0) {
-        const hidden = (expanded && !peerCollapsed) ? '' : ' hidden';
-        for (const h of history) {
-          blocks.push(renderSessionItem(h, {
-            isHead: false,
-            headId: head.id,
-            hidden,
-            isRemote: true,
-          }));
-        }
-      }
+    const peerExpanded = !state.collapsedGroups.has(peerId);
+
+    const remoteByWorkdir = new Map();
+    for (const session of sessions) {
+      const wd = session.workdir || '(未知)';
+      if (!remoteByWorkdir.has(wd)) remoteByWorkdir.set(wd, []);
+      remoteByWorkdir.get(wd).push(session);
     }
+
+    devices.push({
+      id: peerId,
+      name: `🌐 ${peerName}`,
+      expanded: peerExpanded,
+      workdirs: Array.from(remoteByWorkdir.entries()).map(([workdir, sessions]) => {
+        const wdKey = `workdir-${peerId}-${workdir}`;
+        return {
+          workdir,
+          sessions: sessions.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)), // 最新的在最上面
+          expanded: state.expandedWorkdirs.has(wdKey) // 根据 expandedWorkdirs 判断是否展开
+        };
+      }),
+      isLocal: false,
+    });
   }
 
-  ul.innerHTML = blocks.join('');
+  const html = devices.map(device => {
+    const deviceActive = device.workdirs.some(wd =>
+      wd.sessions.some(s => s.id === state.activeSessionId)
+    );
+    const settingsActive = state.view === 'app-settings' && device.isLocal;
 
-  $$('.session-item').forEach((el) => {
-    el.addEventListener('click', (ev) => {
-      if (ev.target.closest('.si-toggle')) return;
-      if (ev.target.closest('.si-delete')) return;
-      selectSession(el.dataset.id);
-    });
-  });
-  $$('.si-toggle').forEach((btn) => {
-    btn.addEventListener('click', (ev) => {
-      ev.stopPropagation();
-      const headId = btn.dataset.head;
-      if (state.expandedHeads.has(headId)) state.expandedHeads.delete(headId);
-      else state.expandedHeads.add(headId);
+    return `
+      <li class="nav-tree-item">
+        <div class="nav-tree-item-wrapper">
+          <button class="nav-tree-node device ${device.expanded ? 'expanded' : ''} ${deviceActive || settingsActive ? 'active' : ''}" data-device="${device.id}">
+            <span class="nav-tree-caret">▸</span>
+            <span class="nav-tree-label">${device.name}</span>
+          </button>
+          ${device.isLocal ? `
+            <div class="device-actions">
+              <button class="device-action-btn" data-action="new-session" title="新建会话">
+                <span>＋</span>
+              </button>
+              <button class="device-action-btn" data-action="app-settings" title="应用设置">
+                <span>⚙️</span>
+              </button>
+            </div>
+          ` : ''}
+        </div>
+        <ul class="nav-tree-children ${device.expanded ? '' : 'collapsed'}">
+          ${device.workdirs.map(wd => {
+            const wdKey = device.isLocal ? `workdir-${wd.workdir}` : `workdir-${device.id}-${wd.workdir}`;
+            const wdActive = wd.sessions.some(s => s.id === state.activeSessionId);
+            const latestSession = wd.sessions[0]; // 最新的会话
+            const displayName = latestSession ? (latestSession.name || 'Untitled') : '空目录';
+
+            return `
+              <li class="nav-tree-item">
+                <button class="nav-tree-node workdir ${wd.expanded ? 'expanded' : ''} ${wdActive ? 'active' : ''}"
+                        data-workdir-key="${wdKey}" data-device="${device.id}">
+                  <span class="nav-tree-caret" data-action="toggle-workdir">▸</span>
+                  <span class="nav-tree-icon">💬</span>
+                  <span class="nav-tree-label" title="${escapeHtml(wd.workdir)}">${escapeHtml(displayName)}</span>
+                </button>
+                <ul class="nav-tree-children ${wd.expanded ? '' : 'collapsed'}">
+                  ${wd.sessions.map((session, idx) => {
+                    const sessionActive = session.id === state.activeSessionId;
+                    // 跳过第一个会话，因为它已经显示在父级标题上
+                    if (idx === 0) return '';
+                    return `
+                      <li class="nav-tree-item">
+                        <button class="nav-tree-node session ${sessionActive ? 'active' : ''}"
+                                data-session="${session.id}" data-device="${device.id}">
+                          <span class="nav-tree-icon">💬</span>
+                          <span class="nav-tree-label">${escapeHtml(session.name || 'Untitled')}</span>
+                        </button>
+                      </li>
+                    `;
+                  }).join('')}
+                </ul>
+              </li>
+            `;
+          }).join('')}
+        </ul>
+      </li>
+    `;
+  }).join('');
+
+  navTree.innerHTML = html;
+
+  // 设备节点点击展开/折叠
+  $$('.nav-tree-node.device').forEach(node => {
+    node.addEventListener('click', (ev) => {
+      const deviceId = node.dataset.device;
+      if (state.collapsedGroups.has(deviceId)) {
+        state.collapsedGroups.delete(deviceId);
+      } else {
+        state.collapsedGroups.add(deviceId);
+      }
       renderSessionList();
     });
   });
-  $$('.si-delete').forEach((btn) => {
+
+  // 设备操作按钮（新建会话、应用设置）
+  $$('.device-action-btn').forEach(btn => {
     btn.addEventListener('click', (ev) => {
-      ev.stopPropagation();
-      deleteSession(btn.dataset.del);
+      ev.stopPropagation(); // 防止触发设备节点的展开/折叠
+      const action = btn.dataset.action;
+      if (action === 'new-session') {
+        openNewSessionDialog();
+      } else if (action === 'app-settings') {
+        switchView('app-settings');
+      }
     });
   });
+
+  // 工作目录节点点击展开/折叠
+  $$('.nav-tree-node.workdir').forEach(node => {
+    node.addEventListener('click', (ev) => {
+      const caret = ev.target.closest('[data-action="toggle-workdir"]');
+      const wdKey = node.dataset.workdirKey;
+
+      if (caret) {
+        // 点击三角按钮：切换展开/折叠
+        ev.stopPropagation();
+        if (state.expandedWorkdirs.has(wdKey)) {
+          state.expandedWorkdirs.delete(wdKey);
+        } else {
+          state.expandedWorkdirs.add(wdKey);
+        }
+        renderSessionList();
+      } else {
+        // 点击目录本身：选择该目录下最新的会话（第一个）
+        const deviceId = node.dataset.device;
+        const device = devices.find(d => d.id === deviceId);
+        if (device) {
+          const workdir = device.workdirs.find(wd => {
+            const key = device.isLocal ? `workdir-${wd.workdir}` : `workdir-${deviceId}-${wd.workdir}`;
+            return key === wdKey;
+          });
+          if (workdir && workdir.sessions.length > 0) {
+            // 选择第一个会话（最新的）
+            selectSession(workdir.sessions[0].id);
+          }
+        }
+      }
+    });
+  });
+
+  // 会话节点点击选中会话
+  $$('.nav-tree-node.session').forEach(node => {
+    node.addEventListener('click', (ev) => {
+      const sessionId = node.dataset.session;
+      selectSession(sessionId);
+    });
+  });
+
+  // 设置项点击
+  $$('.nav-tree-node.setting').forEach(node => {
+    node.addEventListener('click', (ev) => {
+      switchView(node.dataset.view);
+    });
+  });
+
+  // 删除旧的 si-group-add 监听器逻辑（如果还有的话）
   $$('.si-group-collapsible').forEach((el) => {
     el.addEventListener('click', (ev) => {
       if (ev.target.closest('.si-group-add')) return;
@@ -864,6 +1007,19 @@ async function selectSession(id) {
   state.gitNexusHierarchySelected = null;
   state.gitNexusHierarchyHover = null;
   state.approvalRenderSig = null;
+
+  // 选中会话时默认切换到对话视图
+  switchView('chat');
+
+  // 保存到 localStorage
+  try {
+    localStorage.setItem('activeSessionId', id);
+  } catch (e) {
+    console.warn('Failed to save session to localStorage:', e);
+  }
+
+  // 恢复该会话的输入框草稿
+  restorePromptDraft();
 
   const cached = state.detailCache.get(id);
   if (cached) {
@@ -1021,10 +1177,44 @@ function handleSessionEvent(evt) {
 // ===== Views =====
 function switchView(name) {
   state.view = name;
-  $$('.nav-btn').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
+
+  // 更新树形导航中的活动状态
+  $$('.nav-tree-node').forEach((node) => {
+    const isActive = (
+      (node.dataset.view === name) ||
+      (node.classList.contains('session') && node.dataset.session === state.activeSessionId) ||
+      (node.classList.contains('workdir') && (
+        // 工作目录节点：如果其下任何会话被选中，则高亮
+        $$('.nav-tree-node.session').some(s =>
+          s.dataset.session === state.activeSessionId &&
+          s.closest('.nav-tree-children')?.previousElementSibling?.dataset.workdirKey === node.dataset.workdirKey
+        )
+      )) ||
+      (node.classList.contains('device') && (
+        state.sessions.some(s => s.id === state.activeSessionId) ||
+        (name === 'app-settings' && node.dataset.device === 'local')
+      ))
+    );
+    node.classList.toggle('active', isActive);
+  });
+
+  // 更新顶部会话视图标签页
+  const sessionViewTabs = $('#sessionViewTabs');
+  const isSessionView = ['chat', 'changes', 'structure', 'audit', 'policy', 'memory', 'session-settings'].includes(name);
+  if (isSessionView && state.activeSessionId) {
+    sessionViewTabs.classList.remove('hidden');
+    $$('.session-view-tab').forEach((tab) => {
+      tab.classList.toggle('active', tab.dataset.view === name);
+    });
+  } else {
+    sessionViewTabs.classList.add('hidden');
+  }
+
+  // 切换视图显示
   $$('.view').forEach((v) => v.classList.add('hidden'));
   const el = document.getElementById(`view-${name}`);
   if (el) el.classList.remove('hidden');
+
   renderViewIfActive();
 }
 
@@ -1055,9 +1245,11 @@ function renderViewIfActive() {
   else if (state.view === 'memory') {
     if (!state.memory) loadMemory();
     else renderMemoryView();
-  } else if (state.view === 'settings') {
+  } else if (state.view === 'app-settings') {
     if (state.settingsProfiles.length === 0 && !state.editingProfileId) loadSettingsProfiles();
-    else if (!state.editingProfileId) renderSettingsView();
+    else if (!state.editingProfileId) renderAppSettingsView();
+  } else if (state.view === 'session-settings') {
+    renderSessionSettingsView();
   }
 }
 
@@ -1865,6 +2057,10 @@ async function submitPrompt(e) {
   const txt = $('#promptInput').value.trim();
   if (!txt || !state.activeSessionId) return;
   $('#promptInput').value = '';
+
+  // 清除草稿
+  clearPromptDraft();
+
   const body = { prompt: txt };
   if (pendingImages.length > 0) {
     body.images = pendingImages.splice(0);
@@ -1894,7 +2090,10 @@ async function startNextTask() {
   if (!state.detail) return;
   const cur = state.detail.session;
   const baseName = (cur.name || '').replace(/\s*#\d+$/, '');
-  const nextNum = state.sessions.filter((s) => (s.name || '').startsWith(baseName)).length + 1;
+
+  // 根据当前会话是本地还是远端，从对应的会话列表中过滤
+  const sessionList = cur._peerId ? state.remoteSessions : state.sessions;
+  const nextNum = sessionList.filter((s) => (s.name || '').startsWith(baseName)).length + 1;
 
   const draft = buildNextTaskDraft(state.detail);
   const body = {
@@ -1904,9 +2103,19 @@ async function startNextTask() {
     parentSessionId: cur.id,
   };
   try {
-    const resp = await api('/api/sessions', { method: 'POST', body: JSON.stringify(body) });
+    // 如果当前会话是远端会话，创建请求也要发到远端服务器
+    const apiPath = cur._peerId
+      ? `/api/remote/${cur._peerId}/sessions`
+      : '/api/sessions';
+    const resp = await api(apiPath, { method: 'POST', body: JSON.stringify(body) });
     state.pendingPromptDraft = { sessionId: resp.session.id, text: draft };
-    await refreshSessions();
+
+    // 远端会话需要刷新远端会话列表，本地会话刷新本地列表
+    if (cur._peerId) {
+      await refreshPeers();
+    } else {
+      await refreshSessions();
+    }
     selectSession(resp.session.id);
     applyPendingPromptDraft();
     $('#promptInput').focus();
@@ -4147,7 +4356,11 @@ function renderTerminal() {
   attachTerminalToActiveSession();
 }
 
-// ===== Settings profiles =====
+// ===== Settings =====
+// Split settings into two categories:
+// - App Settings: global configuration (model, API key, theme, profiles)
+// - Session Settings: per-session configuration (workdir, policy, environment)
+
 async function loadSettingsProfiles() {
   try {
     const resp = await api('/api/settings/profiles');
@@ -4156,7 +4369,7 @@ async function loadSettingsProfiles() {
   } catch (e) {
     state.settingsProfiles = [];
   }
-  renderSettingsView();
+  renderAppSettingsView();
 }
 
 async function createSettingsProfile(name, content) {
@@ -4223,15 +4436,17 @@ async function activateSettingsProfile(id) {
   }
 }
 
-function renderSettingsView() {
-  const container = $('#settingsView');
+function renderAppSettingsView() {
+  const container = $('#appSettingsView');
   if (!container) return;
 
   const profiles = state.settingsProfiles;
   const editing = state.editingProfileId;
 
-  let html = '<div class="settings-header"><h3>Claude Settings 配置管理</h3>';
-  html += '<button class="primary-btn settings-new-btn" id="settingsNewBtn">＋ 新建配置</button></div>';
+  let html = '<div class="settings-header">';
+  html += '<div><h3>🔧 应用设置</h3>';
+  html += '<p class="settings-subtitle">全局配置：模型、API、主题、权限等应用级别设置</p></div>';
+  html += '<button class="primary-btn settings-new-btn" id="settingsNewBtn">＋ 新建配置方案</button></div>';
 
   if (editing === 'new') {
     html += renderSettingsForm(null);
@@ -4268,7 +4483,7 @@ function renderSettingsView() {
   if (newBtn) {
     newBtn.addEventListener('click', () => {
       state.editingProfileId = 'new';
-      renderSettingsView();
+      renderAppSettingsView();
     });
   }
   $$('.settings-activate-btn').forEach((btn) => {
@@ -4277,7 +4492,7 @@ function renderSettingsView() {
   $$('.settings-edit-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       state.editingProfileId = btn.dataset.pid;
-      renderSettingsView();
+      renderAppSettingsView();
     });
   });
   $$('.settings-delete-btn').forEach((btn) => {
@@ -4295,7 +4510,7 @@ function renderSettingsView() {
     });
     $('#spfCancel')?.addEventListener('click', () => {
       state.editingProfileId = null;
-      renderSettingsView();
+      renderAppSettingsView();
     });
     $('#spfImportCurrent')?.addEventListener('click', async () => {
       try {
@@ -4329,6 +4544,87 @@ function renderSettingsForm(profile) {
       <button type="submit" class="primary-btn">保存</button>
     </div>
   </form>`;
+}
+
+function renderSessionSettingsView() {
+  const container = $('#sessionSettingsView');
+  if (!container) return;
+
+  const session = state.detail?.session;
+
+  let html = '<div class="settings-header">';
+  html += '<div><h3>⚡ 会话配置</h3>';
+  html += '<p class="settings-subtitle">当前会话的配置：工作目录、策略、环境变量等</p></div>';
+  html += '</div>';
+
+  if (!session) {
+    html += '<div class="empty">请先选择一个会话</div>';
+  } else {
+    html += '<div class="session-settings-grid">';
+
+    // Basic info section
+    html += '<div class="settings-section">';
+    html += '<h4>📋 基本信息</h4>';
+    html += '<div class="settings-field">';
+    html += '<label>会话名称</label>';
+    html += `<div class="settings-value">${escapeHtml(session.name)}</div>`;
+    html += '</div>';
+    html += '<div class="settings-field">';
+    html += '<label>会话 ID</label>';
+    html += `<div class="settings-value code">${escapeHtml(session.id)}</div>`;
+    html += '</div>';
+    html += '<div class="settings-field">';
+    html += '<label>创建时间</label>';
+    html += `<div class="settings-value">${fmtDateTime(session.createdAt)}</div>`;
+    html += '</div>';
+    html += '</div>';
+
+    // Workdir section
+    html += '<div class="settings-section">';
+    html += '<h4>📁 工作目录</h4>';
+    html += '<div class="settings-field">';
+    html += '<label>路径</label>';
+    html += `<div class="settings-value code">${escapeHtml(session.workdir)}</div>`;
+    html += '</div>';
+    html += '</div>';
+
+    // Policy section
+    html += '<div class="settings-section">';
+    html += '<h4>⚙️ 运行策略</h4>';
+    html += '<div class="settings-field">';
+    html += '<label>当前策略</label>';
+    const policyName = state.policies[session.policyId]?.name || session.policyId;
+    html += `<div class="settings-value">${escapeHtml(policyName)}</div>`;
+    html += '</div>';
+    if (state.policies[session.policyId]?.description) {
+      html += '<div class="settings-field">';
+      html += '<label>策略说明</label>';
+      html += `<div class="settings-value">${escapeHtml(state.policies[session.policyId].description)}</div>`;
+      html += '</div>';
+    }
+    html += '</div>';
+
+    // Stats section
+    html += '<div class="settings-section">';
+    html += '<h4>📊 会话统计</h4>';
+    html += '<div class="settings-field">';
+    html += '<label>对话轮数</label>';
+    html += `<div class="settings-value">${session.turnCount} 轮</div>`;
+    html += '</div>';
+    html += '<div class="settings-field">';
+    html += '<label>变更文件数</label>';
+    html += `<div class="settings-value">${session.changeCount} 个文件</div>`;
+    html += '</div>';
+    html += '<div class="settings-field">';
+    html += '<label>当前状态</label>';
+    html += `<div class="settings-value"><span class="status-pill ${session.status}">${labelFor(session.status)}</span></div>`;
+    html += '</div>';
+    html += '</div>';
+
+    html += '</div>';
+  }
+
+  container.innerHTML = html;
 }
 
 init().catch((err) => {

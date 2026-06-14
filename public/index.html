@@ -24,21 +24,9 @@
           </div>
         </div>
 
-        <button id="newSessionBtn" class="primary-btn">＋ 新建会话</button>
-
         <nav class="nav">
-          <div class="nav-section-title">会话</div>
-          <ul id="sessionList" class="session-list"></ul>
-          <div class="nav-section-title" style="margin-top:18px">视图</div>
-          <ul class="nav-list">
-            <li><button data-view="chat" class="nav-btn active">对话</button></li>
-            <li><button data-view="changes" class="nav-btn">变更</button></li>
-            <li><button data-view="structure" class="nav-btn">结构图</button></li>
-            <li><button data-view="audit" class="nav-btn">审计回放</button></li>
-            <li><button data-view="policy" class="nav-btn">策略</button></li>
-            <li><button data-view="memory" class="nav-btn">记忆</button></li>
-            <li><button data-view="settings" class="nav-btn">设置</button></li>
-          </ul>
+          <!-- 树形导航：设备 → 会话/设置 → 会话选项 -->
+          <ul id="navTree" class="nav-tree"></ul>
         </nav>
 
         <div class="peer-status" id="peerStatus"></div>
@@ -50,6 +38,17 @@
           <div class="session-info">
             <div class="session-title" id="sessionTitle">未选择会话</div>
             <div class="session-meta" id="sessionMeta"></div>
+          </div>
+          <div class="topbar-actions">
+            <div id="sessionViewTabs" class="session-view-tabs hidden">
+              <button data-view="chat" class="session-view-tab active">💬 对话</button>
+              <button data-view="changes" class="session-view-tab">📝 变更</button>
+              <button data-view="structure" class="session-view-tab">🌲 结构</button>
+              <button data-view="audit" class="session-view-tab">📊 审计</button>
+              <button data-view="policy" class="session-view-tab">⚙️ 策略</button>
+              <button data-view="memory" class="session-view-tab">🧠 记忆</button>
+              <button data-view="session-settings" class="session-view-tab">⚡ 配置</button>
+            </div>
           </div>
         </header>
 
@@ -159,8 +158,12 @@
           <div id="memoryView" class="memory-view"></div>
         </section>
 
-        <section class="view hidden" id="view-settings">
-          <div id="settingsView" class="settings-view"></div>
+        <section class="view hidden" id="view-app-settings">
+          <div id="appSettingsView" class="settings-view"></div>
+        </section>
+
+        <section class="view hidden" id="view-session-settings">
+          <div id="sessionSettingsView" class="settings-view"></div>
         </section>
       </main>
     </div>
