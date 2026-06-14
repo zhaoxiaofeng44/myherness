@@ -14,8 +14,11 @@
   },
   "license": "MIT",
   "dependencies": {
+    "@nut-tree-fork/nut-js": "^4.2.6",
+    "jimp": "^0.22.12",
     "madge": "^8.0.0",
     "node-pty": "^1.1.0",
+    "sharp": "^0.34.5",
     "typescript": "^6.0.3"
   },
   "overrides": {

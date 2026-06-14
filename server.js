@@ -21,6 +21,7 @@ import { TerminalManager } from './src/terminalManager.js';
 import { GOAL_PROMPT_PATHS } from './src/goalRunner.js';
 import { PeerManager } from './src/peerManager.js';
 import { SettingsProfileStore } from './src/settingsProfiles.js';
+import { executeAction, getSystemStatus } from './src/computerControl.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -569,6 +570,110 @@ const server = http.createServer(async (req, res) => {
       }
 
       return json(res, 404, { error: '未知接口' });
+    }
+
+    // ===== Computer control routes =====
+    if (pathname === '/api/computer/status' && req.method === 'GET') {
+      try {
+        const status = await getSystemStatus();
+        return json(res, 200, status);
+      } catch (e) {
+        return json(res, 500, { error: e.message });
+      }
+    }
+
+    if (pathname === '/api/computer/action' && req.method === 'POST') {
+      try {
+        const body = await readJson(req);
+        const { action, coordinate, text } = body;
+
+        if (!action) {
+          return json(res, 400, { error: 'action is required' });
+        }
+
+        const result = await executeAction(action, coordinate, text);
+        return json(res, 200, result);
+      } catch (e) {
+        console.error('[computer/action]', e);
+        return json(res, 500, { error: e.message });
+      }
+    }
+
+    if (pathname === '/api/computer/screenshot' && req.method === 'GET') {
+      try {
+        const result = await executeAction('get_screenshot');
+        // Return base64 image in JSON
+        return json(res, 200, result);
+      } catch (e) {
+        console.error('[computer/screenshot]', e);
+        return json(res, 500, { error: e.message });
+      }
+    }
+
+    if (pathname === '/api/ollama/health' && req.method === 'GET') {
+      try {
+        const checkOllama = async () => {
+          const response = await fetch('http://localhost:11434/api/tags');
+          if (!response.ok) throw new Error('ollama service not responding');
+          const data = await response.json();
+          const models = data.models || [];
+          const modelFound = models.some(m => m.name === 'minicpm-v4.6:1b');
+          return { available: true, modelFound };
+        };
+        const result = await checkOllama();
+        return json(res, 200, result);
+      } catch (e) {
+        return json(res, 200, { available: false, modelFound: false, error: e.message });
+      }
+    }
+
+    if (pathname === '/api/computer/smart-screenshot' && req.method === 'POST') {
+      try {
+        const body = await readJson(req);
+        const prompt = body.prompt;
+
+        if (!prompt || typeof prompt !== 'string' || prompt.trim().length === 0) {
+          return json(res, 400, { error: '请输入问题' });
+        }
+
+        // Get screenshot
+        const screenshot = await executeAction('get_screenshot');
+
+        // Call ollama API using chat endpoint for vision models
+        const ollamaResponse = await fetch('http://localhost:11434/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'minicpm-v4.6:1b',
+            messages: [
+              {
+                role: 'user',
+                content: prompt.trim(),
+                images: [screenshot.image]
+              }
+            ],
+            stream: false
+          })
+        });
+
+        if (!ollamaResponse.ok) {
+          throw new Error(`ollama API 返回错误: ${ollamaResponse.status}`);
+        }
+
+        const ollamaData = await ollamaResponse.json();
+        const result = ollamaData.message?.content || '';
+
+        return json(res, 200, {
+          success: true,
+          result: result.trim(),
+          screenshot: screenshot.image,
+          imageWidth: screenshot.image_width,
+          imageHeight: screenshot.image_height
+        });
+      } catch (e) {
+        console.error('[computer/smart-screenshot]', e);
+        return json(res, 500, { success: false, error: e.message });
+      }
     }
 
     // Static file serving from public/

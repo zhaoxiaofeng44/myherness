@@ -60,6 +60,9 @@ const state = {
   peers: [],          // [{ id, name, host, httpPort }]
   lanMode: false,
   remoteSessions: [], // [{ ...session, _peerId, _peerName }]
+  // ===== Computer control =====
+  computerStatus: null, // system status from /api/computer/status
+  ollamaHealth: null, // ollama health status from /api/ollama/health
 };
 
 // ===== Utility =====
@@ -757,16 +760,23 @@ function renderSessionList() {
             <span class="nav-tree-caret">▸</span>
             <span class="nav-tree-label">${device.name}</span>
           </button>
-          ${device.isLocal ? `
-            <div class="device-actions">
+          <div class="device-actions">
+            ${device.isLocal ? `
               <button class="device-action-btn" data-action="new-session" title="新建会话">
                 <span>＋</span>
               </button>
-              <button class="device-action-btn" data-action="app-settings" title="应用设置">
-                <span>⚙️</span>
+              <button class="device-action-btn" data-action="computer-control" title="电脑控制">
+                <span>🖥️</span>
               </button>
-            </div>
-          ` : ''}
+            ` : `
+              <button class="device-action-btn" data-action="new-session-remote" data-peer="${device.id}" title="新建会话">
+                <span>＋</span>
+              </button>
+            `}
+            <button class="device-action-btn" data-action="app-settings" data-peer="${device.isLocal ? '' : device.id}" title="应用设置">
+              <span>⚙️</span>
+            </button>
+          </div>
         </div>
         <ul class="nav-tree-children ${device.expanded ? '' : 'collapsed'}">
           ${device.workdirs.map(wd => {
@@ -775,25 +785,36 @@ function renderSessionList() {
             const latestSession = wd.sessions[0]; // 最新的会话
             const displayName = latestSession ? (latestSession.name || 'Untitled') : '空目录';
 
+            // 获取会话状态并显示（除了 idle 状态）
+            const statusBadge = latestSession && latestSession.status !== 'idle'
+              ? `<span class="session-status-badge status-${latestSession.status}">${getStatusLabel(latestSession.status)}</span>`
+              : '';
+
             return `
               <li class="nav-tree-item">
                 <button class="nav-tree-node workdir ${wd.expanded ? 'expanded' : ''} ${wdActive ? 'active' : ''}"
                         data-workdir-key="${wdKey}" data-device="${device.id}">
                   <span class="nav-tree-caret" data-action="toggle-workdir">▸</span>
                   <span class="nav-tree-icon">💬</span>
-                  <span class="nav-tree-label" title="${escapeHtml(wd.workdir)}">${escapeHtml(displayName)}</span>
+                  <span class="nav-tree-label" title="${escapeHtml(wd.workdir)}">${escapeHtml(displayName)}${statusBadge}</span>
                 </button>
                 <ul class="nav-tree-children ${wd.expanded ? '' : 'collapsed'}">
                   ${wd.sessions.map((session, idx) => {
                     const sessionActive = session.id === state.activeSessionId;
                     // 跳过第一个会话，因为它已经显示在父级标题上
                     if (idx === 0) return '';
+
+                    // 获取会话状态并显示（除了 idle 状态）
+                    const statusBadge = session.status !== 'idle'
+                      ? `<span class="session-status-badge status-${session.status}">${getStatusLabel(session.status)}</span>`
+                      : '';
+
                     return `
                       <li class="nav-tree-item">
                         <button class="nav-tree-node session ${sessionActive ? 'active' : ''}"
                                 data-session="${session.id}" data-device="${device.id}">
                           <span class="nav-tree-icon">💬</span>
-                          <span class="nav-tree-label">${escapeHtml(session.name || 'Untitled')}</span>
+                          <span class="nav-tree-label">${escapeHtml(session.name || 'Untitled')}${statusBadge}</span>
                         </button>
                       </li>
                     `;
@@ -822,15 +843,32 @@ function renderSessionList() {
     });
   });
 
-  // 设备操作按钮（新建会话、应用设置）
+  // 设备操作按钮（新建会话、电脑控制、应用设置）
   $$('.device-action-btn').forEach(btn => {
     btn.addEventListener('click', (ev) => {
       ev.stopPropagation(); // 防止触发设备节点的展开/折叠
       const action = btn.dataset.action;
+      const peerId = btn.dataset.peer;
+
       if (action === 'new-session') {
         openNewSessionDialog();
+      } else if (action === 'new-session-remote') {
+        // 为远程设备新建会话
+        const peer = state.peers.find(p => p.id === peerId);
+        if (peer) {
+          state.newSessionTargetPeer = { id: peer.id, name: peer.name };
+          openNewSessionDialog();
+        }
+      } else if (action === 'computer-control') {
+        switchView('computer');
       } else if (action === 'app-settings') {
-        switchView('app-settings');
+        // 支持远程设备的设置页面（如果需要）
+        if (peerId) {
+          // TODO: 实现远程设备设置视图
+          alert(`远程设备 ${peerId} 的设置功能待实现`);
+        } else {
+          switchView('app-settings');
+        }
       }
     });
   });
@@ -1245,7 +1283,8 @@ function renderViewIfActive() {
   else if (state.view === 'memory') {
     if (!state.memory) loadMemory();
     else renderMemoryView();
-  } else if (state.view === 'app-settings') {
+  } else if (state.view === 'computer') renderComputerView();
+  else if (state.view === 'app-settings') {
     if (state.settingsProfiles.length === 0 && !state.editingProfileId) loadSettingsProfiles();
     else if (!state.editingProfileId) renderAppSettingsView();
   } else if (state.view === 'session-settings') {
@@ -1315,6 +1354,18 @@ function labelFor(status) {
     cancelling: '停止中', cancelled: '已取消',
     error: '错误', ended: '已结束',
   }[status] || status;
+}
+
+function getStatusLabel(status) {
+  // 简化版，用于导航树的徽章
+  return {
+    running: '▶',
+    waiting: '⏸',
+    cancelling: '⏹',
+    cancelled: '✗',
+    error: '⚠',
+    ended: '✓',
+  }[status] || '';
 }
 
 // ===== Chat view =====
@@ -4625,6 +4676,213 @@ function renderSessionSettingsView() {
   }
 
   container.innerHTML = html;
+}
+
+// ===== Computer Control View =====
+async function renderComputerView() {
+  // Load system status on first render
+  if (!state.computerStatus) {
+    try {
+      const res = await fetch('/api/computer/status');
+      state.computerStatus = await res.json();
+    } catch (e) {
+      console.error('Failed to load computer status:', e);
+      state.computerStatus = { error: e.message };
+    }
+  }
+
+  // Check ollama health
+  if (!state.ollamaHealth) {
+    try {
+      const res = await fetch('/api/ollama/health');
+      state.ollamaHealth = await res.json();
+    } catch (e) {
+      console.error('Failed to check ollama health:', e);
+      state.ollamaHealth = { available: false, modelFound: false, error: e.message };
+    }
+  }
+
+  // Display system status
+  const statusContent = $('#computerStatusContent');
+  if (statusContent) {
+    if (state.computerStatus.error) {
+      statusContent.innerHTML = `<span class="error">错误: ${escapeHtml(state.computerStatus.error)}</span>`;
+    } else {
+      statusContent.innerHTML = `
+        平台: ${escapeHtml(state.computerStatus.platform)} |
+        屏幕: ${state.computerStatus.screenWidth}×${state.computerStatus.screenHeight}
+        ${state.computerStatus.hasXdotool ? ' | xdotool: ✓' : ''}
+      `;
+    }
+  }
+
+  // Display ollama health status
+  const statusBadge = $('#smartScreenshotStatus');
+  const smartBtn = $('#smartScreenshotBtn');
+  if (statusBadge && smartBtn) {
+    if (state.ollamaHealth.available && state.ollamaHealth.modelFound) {
+      statusBadge.innerHTML = '✓ 可用';
+      statusBadge.className = 'status-badge status-ok';
+      smartBtn.disabled = false;
+    } else if (!state.ollamaHealth.available) {
+      statusBadge.innerHTML = '✗ ollama 未运行';
+      statusBadge.className = 'status-badge status-unavailable';
+      smartBtn.disabled = true;
+    } else {
+      statusBadge.innerHTML = '✗ 模型未安装';
+      statusBadge.className = 'status-badge status-unavailable';
+      smartBtn.disabled = true;
+    }
+  }
+
+  // Auto-refresh screenshot on first load
+  if (!$('#screenshotImg').src || $('#screenshotImg').src === location.href) {
+    setTimeout(() => refreshScreenshot(), 100);
+  }
+
+  // Bind event handlers (only once)
+  if (!$('#refreshScreenBtn').hasAttribute('data-bound')) {
+    $('#refreshScreenBtn').setAttribute('data-bound', 'true');
+    $('#refreshScreenBtn').addEventListener('click', refreshScreenshot);
+
+    $('#moveMouseBtn').addEventListener('click', async () => {
+      const x = parseInt($('#mouseX').value, 10);
+      const y = parseInt($('#mouseY').value, 10);
+      if (isNaN(x) || isNaN(y)) return alert('请输入有效的坐标');
+      await executeComputerAction('mouse_move', [x, y]);
+    });
+
+    $('#leftClickBtn').addEventListener('click', async () => {
+      const x = parseInt($('#mouseX').value, 10);
+      const y = parseInt($('#mouseY').value, 10);
+      const coordinate = (!isNaN(x) && !isNaN(y)) ? [x, y] : undefined;
+      await executeComputerAction('left_click', coordinate);
+    });
+
+    $('#rightClickBtn').addEventListener('click', async () => {
+      const x = parseInt($('#mouseX').value, 10);
+      const y = parseInt($('#mouseY').value, 10);
+      const coordinate = (!isNaN(x) && !isNaN(y)) ? [x, y] : undefined;
+      await executeComputerAction('right_click', coordinate);
+    });
+
+    $('#doubleClickBtn').addEventListener('click', async () => {
+      const x = parseInt($('#mouseX').value, 10);
+      const y = parseInt($('#mouseY').value, 10);
+      const coordinate = (!isNaN(x) && !isNaN(y)) ? [x, y] : undefined;
+      await executeComputerAction('double_click', coordinate);
+    });
+
+    $('#typeTextBtn').addEventListener('click', async () => {
+      const text = $('#keyInput').value;
+      if (!text) return alert('请输入文本');
+      await executeComputerAction('type', undefined, text);
+    });
+
+    $('#pressKeyBtn').addEventListener('click', async () => {
+      const text = $('#keyInput').value;
+      if (!text) return alert('请输入按键（如 ctrl+c）');
+      await executeComputerAction('key', undefined, text);
+    });
+
+    $('#scrollBtn').addEventListener('click', async () => {
+      const x = parseInt($('#mouseX').value, 10);
+      const y = parseInt($('#mouseY').value, 10);
+      if (isNaN(x) || isNaN(y)) return alert('请先设置坐标');
+      const direction = $('#scrollDirection').value;
+      const amount = parseInt($('#scrollAmount').value, 10) || 300;
+      await executeComputerAction('scroll', [x, y], `${direction}:${amount}`);
+    });
+
+    $('#smartScreenshotBtn').addEventListener('click', async () => {
+      const prompt = $('#smartScreenshotPrompt').value.trim();
+      if (!prompt) {
+        alert('请输入问题');
+        return;
+      }
+
+      const btn = $('#smartScreenshotBtn');
+      const resultBox = $('#smartScreenshotResult');
+      const originalText = btn.textContent;
+
+      try {
+        btn.disabled = true;
+        btn.textContent = '分析中…';
+        resultBox.classList.add('hidden');
+
+        const res = await fetch('/api/computer/smart-screenshot', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt })
+        });
+        const data = await res.json();
+
+        if (!data.success) {
+          throw new Error(data.error || '分析失败');
+        }
+
+        // Display result
+        resultBox.innerHTML = `
+          <div class="smart-result-content">
+            <div class="smart-result-text">${escapeHtml(data.result)}</div>
+            ${data.screenshot ? `<img src="data:image/png;base64,${data.screenshot}" class="smart-result-thumbnail" alt="Screenshot" />` : ''}
+          </div>
+        `;
+        resultBox.classList.remove('hidden');
+      } catch (e) {
+        alert(`智能截图失败: ${e.message}`);
+      } finally {
+        btn.disabled = state.ollamaHealth && state.ollamaHealth.available && state.ollamaHealth.modelFound ? false : true;
+        btn.textContent = originalText;
+      }
+    });
+  }
+}
+
+async function refreshScreenshot() {
+  const loading = $('#screenshotLoading');
+  const img = $('#screenshotImg');
+  try {
+    loading.classList.remove('hidden');
+    const res = await fetch('/api/computer/action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'get_screenshot' })
+    });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    img.src = `data:${data.mimeType || 'image/png'};base64,${data.image}`;
+  } catch (e) {
+    alert('截屏失败: ' + e.message);
+  } finally {
+    loading.classList.add('hidden');
+  }
+}
+
+async function executeComputerAction(action, coordinate, text) {
+  try {
+    const body = { action };
+    if (coordinate) body.coordinate = coordinate;
+    if (text) body.text = text;
+
+    const res = await fetch('/api/computer/action', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+
+    // Show success feedback briefly
+    const statusContent = $('#computerStatusContent');
+    const originalHtml = statusContent.innerHTML;
+    statusContent.innerHTML = `<span style="color: #0a0">✓ ${action} 成功</span>`;
+    setTimeout(() => {
+      statusContent.innerHTML = originalHtml;
+    }, 2000);
+  } catch (e) {
+    alert(`操作失败: ${e.message}`);
+  }
 }
 
 init().catch((err) => {

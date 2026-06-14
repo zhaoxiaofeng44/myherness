@@ -142,6 +142,66 @@
           </div>
         </section>
 
+        <section class="view hidden" id="view-computer">
+          <div class="computer-control-panel">
+            <div class="computer-status" id="computerStatus">
+              <div class="status-label">系统状态</div>
+              <div class="status-content" id="computerStatusContent">加载中…</div>
+            </div>
+            <div class="screenshot-preview" id="screenshotPreview">
+              <img id="screenshotImg" alt="Screen Preview" style="max-width:100%;height:auto;" />
+              <div class="screenshot-overlay">
+                <button id="refreshScreenBtn" class="primary-btn">🔄 刷新截屏</button>
+                <span id="screenshotLoading" class="loading-indicator hidden">加载中…</span>
+              </div>
+            </div>
+            <div class="control-actions">
+              <div class="action-group">
+                <h3>鼠标控制</h3>
+                <div class="input-row">
+                  <input type="number" id="mouseX" placeholder="X 坐标" style="width:100px;" />
+                  <input type="number" id="mouseY" placeholder="Y 坐标" style="width:100px;" />
+                </div>
+                <div class="button-row">
+                  <button id="moveMouseBtn" class="ghost-btn">移动</button>
+                  <button id="leftClickBtn" class="ghost-btn">左键</button>
+                  <button id="rightClickBtn" class="ghost-btn">右键</button>
+                  <button id="doubleClickBtn" class="ghost-btn">双击</button>
+                </div>
+              </div>
+              <div class="action-group">
+                <h3>键盘输入</h3>
+                <input type="text" id="keyInput" placeholder="输入文本或按键（如 ctrl+c）..." style="width:100%;" />
+                <div class="button-row">
+                  <button id="typeTextBtn" class="ghost-btn">输入文本</button>
+                  <button id="pressKeyBtn" class="ghost-btn">按键</button>
+                </div>
+              </div>
+              <div class="action-group">
+                <h3>滚轮控制</h3>
+                <div class="input-row">
+                  <select id="scrollDirection" style="width:100px;">
+                    <option value="down">下</option>
+                    <option value="up">上</option>
+                    <option value="left">左</option>
+                    <option value="right">右</option>
+                  </select>
+                  <input type="number" id="scrollAmount" placeholder="像素" value="300" style="width:100px;" />
+                </div>
+                <button id="scrollBtn" class="ghost-btn">滚动（需先设置坐标）</button>
+              </div>
+              <div class="action-group smart-screenshot-group">
+                <h3>智能截图 <span id="smartScreenshotStatus" class="status-badge"></span></h3>
+                <textarea id="smartScreenshotPrompt" placeholder="输入问题，例如：描述屏幕上显示的内容..." rows="2" style="width:100%;"></textarea>
+                <div class="button-row">
+                  <button id="smartScreenshotBtn" class="primary-btn">🤖 智能截图</button>
+                </div>
+                <div id="smartScreenshotResult" class="result-box hidden"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
         <section class="view hidden" id="view-audit">
           <div class="audit-controls">
             <input id="auditFilter" placeholder="按事件类型/文件名/工具过滤…" />
