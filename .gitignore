@@ -3,3 +3,10 @@
 .claude-goal
 /storage
 /node_modules
+
+# Cloudflare Tunnel
+.cloudflare/
+*.log
+
+# Service logs
+logs/
