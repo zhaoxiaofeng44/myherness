@@ -20,6 +20,7 @@ import { relevantForPrompt } from './src/memoryRetriever.js';
 import { TerminalManager } from './src/terminalManager.js';
 import { GOAL_PROMPT_PATHS } from './src/goalRunner.js';
 import { SettingsProfileStore } from './src/settingsProfiles.js';
+import { CliToolManager } from './src/cliToolManager.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
@@ -34,6 +35,7 @@ const memoryStore = new MemoryStore({ file: MEMORY_FILE });
 memoryStore.load();
 const settingsProfileStore = new SettingsProfileStore({ file: SETTINGS_FILE });
 settingsProfileStore.load();
+const cliToolManager = new CliToolManager();
 const deciderQueue = new DeciderQueue();
 const manager = new SessionManager({ store, memoryStore, deciderQueue });
 for (const persisted of store.loadAll()) {
@@ -307,6 +309,25 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { profile: activated });
       }
       return json(res, 404, { error: '未知接口' });
+    }
+
+    // ===== CLI Tool routes =====
+    if (pathname === '/api/cli-tools' && req.method === 'GET') {
+      return json(res, 200, { tools: cliToolManager.getAllToolsStatus() });
+    }
+    if (pathname === '/api/cli-tools/active' && req.method === 'GET') {
+      const active = cliToolManager.getActiveTool();
+      return json(res, 200, { tool: active });
+    }
+    if (pathname === '/api/cli-tools/switch' && req.method === 'POST') {
+      const body = await readJson(req);
+      if (!body.toolId) return json(res, 400, { error: 'toolId 必填' });
+      try {
+        const result = cliToolManager.setActiveTool(body.toolId);
+        return json(res, 200, { tool: result });
+      } catch (e) {
+        return json(res, 400, { error: e.message });
+      }
     }
 
     if (pathname === '/api/events' && req.method === 'GET') {

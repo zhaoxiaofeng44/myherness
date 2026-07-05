@@ -1,11 +1,15 @@
-// One-shot helper around the `claude` CLI. Spawns a fresh process with
-// `--print --output-format stream-json --verbose`, parses the stream-json
-// lines and resolves with the final assistant text (from the `result` event).
+// One-shot helper around the CLI tool. Spawns a fresh process with
+// appropriate arguments for the active CLI tool, parses the output
+// and resolves with the final assistant text.
 // Used by the memory distiller and the LLM decider — both want a short
 // independent inference, not a long-lived conversation.
 import { spawn } from 'node:child_process';
+import { CliToolManager } from './cliToolManager.js';
 
 const DEFAULT_TIMEOUT_MS = 60_000;
+
+// Shared CLI tool manager instance for one-shot calls
+const cliToolManager = new CliToolManager();
 
 // permissionMode: 'plan' is the safest sandbox — Claude can think and reply,
 // but cannot execute Bash/Edit/Write etc. We use it for distillation and
@@ -21,24 +25,25 @@ export async function runClaudeOneShot({
     throw new Error('runClaudeOneShot: prompt is required');
   }
 
-  const args = [
-    '--print',
-    '--output-format', 'stream-json',
-    '--verbose',
-    '--permission-mode', permissionMode,
+  // Build args using the CLI tool manager's adapter
+  const args = cliToolManager.buildArgs({
     prompt,
-  ];
+    permissionMode,
+    resumeSessionId: null,
+    useStdin: false,
+  });
 
   return new Promise((resolve, reject) => {
     let child;
     try {
-      child = spawn('claude', args, {
+      const cliCommand = cliToolManager.getActiveCommand();
+      child = spawn(cliCommand, args, {
         cwd: cwd || process.cwd(),
         env: { ...process.env, FORCE_COLOR: '0' },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (e) {
-      return reject(new Error('spawn claude failed: ' + e.message));
+      return reject(new Error('spawn cli failed: ' + e.message));
     }
 
     let stdoutBuf = '';

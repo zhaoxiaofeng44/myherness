@@ -18,6 +18,7 @@ import {
 import { decideToolApproval, decideAskUserQuestion } from './memoryDecider.js';
 import { relevantForPrompt } from './memoryRetriever.js';
 import { GoalRunner, cleanGoalArtefacts } from './goalRunner.js';
+import { CliToolManager } from './cliToolManager.js';
 
 let _id = 0;
 const nextId = () => `s${Date.now().toString(36)}${(_id++).toString(36)}`;
@@ -43,12 +44,13 @@ const STDOUT_BATCH_SIZE = 20;
 const MAX_FULL_DIFF_CHANGESETS = 3;
 
 export class SessionManager extends EventEmitter {
-  constructor({ store, memoryStore, deciderQueue } = {}) {
+  constructor({ store, memoryStore, deciderQueue, cliToolManager } = {}) {
     super();
     this.sessions = new Map();
     this.store = store || null;
     this.memoryStore = memoryStore || null;
     this.deciderQueue = deciderQueue || null;
+    this.cliToolManager = cliToolManager || new CliToolManager();
   }
 
   list() {
@@ -100,6 +102,7 @@ export class SessionManager extends EventEmitter {
       policyId: resolvedPolicy,
       parentSessionId: parentId,
       bus: this,
+      cliToolManager: this.cliToolManager,
     });
     session._store = this.store;
     session._memoryStore = this.memoryStore;
@@ -148,6 +151,7 @@ export class SessionManager extends EventEmitter {
       policyId: persisted.policyId,
       parentSessionId: persisted.parentSessionId || null,
       bus: this,
+      cliToolManager: this.cliToolManager,
     });
     session._store = this.store;
     session._memoryStore = this.memoryStore;
@@ -202,13 +206,14 @@ export class SessionManager extends EventEmitter {
 }
 
 class Session {
-  constructor({ id, workdir, name, policyId, parentSessionId, bus }) {
+  constructor({ id, workdir, name, policyId, parentSessionId, bus, cliToolManager }) {
     this.id = id;
     this.workdir = workdir;
     this.name = name;
     this.policyId = policyId;
     this.parentSessionId = parentSessionId || null;
     this.bus = bus;
+    this.cliToolManager = cliToolManager || null;
 
     this.createdAt = Date.now();
     this.endedAt = null;
@@ -291,24 +296,39 @@ class Session {
     this.changeTracker.takeSnapshot();
 
     const images = opts.images; // [{ base64, mimeType }] or undefined
-    const args = [
-      '--print',
-      '--output-format', 'stream-json',
-      '--verbose',
-      '--permission-mode', policy.permissionMode,
-    ];
-    if (this.claudeSessionId) {
-      args.push('--resume', this.claudeSessionId);
-    }
     const augmented = this._buildAugmentedPrompt(prompt);
     const useStdin = Array.isArray(images) && images.length > 0;
-    if (!useStdin) {
-      args.push(augmented);
+
+    // Build args using the CLI tool manager's adapter
+    let args;
+    if (this.cliToolManager) {
+      const resumeSessionId = this.cliToolManager.supportsResume() ? this.claudeSessionId : null;
+      args = this.cliToolManager.buildArgs({
+        prompt: augmented,
+        permissionMode: policy.permissionMode,
+        resumeSessionId,
+        useStdin,
+      });
+    } else {
+      // Fallback to claude-style args
+      args = [
+        '--print',
+        '--output-format', 'stream-json',
+        '--verbose',
+        '--permission-mode', policy.permissionMode,
+      ];
+      if (this.claudeSessionId) {
+        args.push('--resume', this.claudeSessionId);
+      }
+      if (!useStdin) {
+        args.push(augmented);
+      }
     }
 
     let child;
     try {
-      child = spawn('claude', args, {
+      const cliCommand = this.cliToolManager ? this.cliToolManager.getActiveCommand() : 'claude';
+      child = spawn(cliCommand, args, {
         cwd: this.workdir,
         env: { ...process.env, FORCE_COLOR: '0' },
         stdio: [useStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],

@@ -1363,6 +1363,14 @@ details[open].thinking-details .thinking-summary::before {
   overflow: auto;
   height: 100%;
 }
+.settings-section {
+  margin-bottom: 24px;
+}
+.settings-section h4 {
+  margin: 0 0 12px;
+  font-size: 14px;
+  font-weight: 600;
+}
 .settings-header {
   display: flex;
   align-items: center;
@@ -1371,6 +1379,75 @@ details[open].thinking-details .thinking-summary::before {
 }
 .settings-header h3 { margin: 0; font-size: 16px; font-weight: 600; }
 .settings-new-btn { font-size: 12px; }
+
+/* ===== CLI Tools ===== */
+.cli-tools-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.cli-tool-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 16px;
+}
+.cli-tool-active {
+  border-color: var(--green);
+}
+.cli-tool-unavailable {
+  opacity: 0.6;
+}
+.cli-tool-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.cli-tool-name {
+  font-weight: 600;
+  font-size: 14px;
+  flex: 1;
+}
+.cli-tool-status {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-weight: 600;
+}
+.cli-tool-status.available {
+  background: var(--green);
+  color: #000;
+}
+.cli-tool-status.unavailable {
+  background: var(--red);
+  color: #fff;
+}
+.cli-tool-desc {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.cli-tool-command {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+.cli-tool-command code {
+  background: var(--panel-2);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: var(--mono);
+}
+.cli-tool-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+.cli-tool-switch-btn {
+  font-size: 11px;
+  padding: 4px 12px;
+}
+
 .settings-card {
   background: var(--panel);
   border: 1px solid var(--border);

@@ -55,10 +55,9 @@ const state = {
   settingsProfiles: [],
   activeProfileId: null,
   editingProfileId: null, // id of profile being edited, or 'new' for create
-  // ===== Remote peers =====
-  peers: [],          // [{ id, name, host, httpPort }]
-  lanMode: false,
-  remoteSessions: [], // [{ ...session, _peerId, _peerName }]
+  // ===== CLI Tools =====
+  cliTools: [],
+  activeCliToolId: null,
 };
 
 // ===== Utility =====
@@ -4227,10 +4226,48 @@ function renderSettingsView() {
   const container = $('#settingsView');
   if (!container) return;
 
+  // Load CLI tools status if not loaded yet
+  if (state.cliTools.length === 0) {
+    loadCliTools();
+    return;
+  }
+
   const profiles = state.settingsProfiles;
   const editing = state.editingProfileId;
 
-  let html = '<div class="settings-header"><h3>Claude Settings 配置管理</h3>';
+  let html = '<div class="settings-header"><h3>设置管理</h3></div>';
+
+  // CLI Tool Switcher Section
+  html += '<div class="settings-section">';
+  html += '<h4>底层 CLI 工具</h4>';
+  html += '<div class="cli-tools-list">';
+  for (const tool of state.cliTools) {
+    const activeClass = tool.isActive ? ' cli-tool-active' : '';
+    const availableClass = tool.available ? '' : ' cli-tool-unavailable';
+    const statusBadge = tool.available
+      ? '<span class="cli-tool-status available">✓ 已安装</span>'
+      : '<span class="cli-tool-status unavailable">✗ 未安装</span>';
+    const switchBtn = tool.available && !tool.isActive
+      ? `<button class="ghost-btn cli-tool-switch-btn" data-tool-id="${tool.id}">切换</button>`
+      : '';
+    const activeBadge = tool.isActive ? '<span class="settings-active-badge">当前使用</span>' : '';
+
+    html += `<div class="cli-tool-card${activeClass}${availableClass}" data-tool-id="${tool.id}">
+      <div class="cli-tool-header">
+        <span class="cli-tool-name">${escapeHtml(tool.name)}</span>
+        ${activeBadge}
+        ${statusBadge}
+      </div>
+      <div class="cli-tool-desc">${escapeHtml(tool.description)}</div>
+      <div class="cli-tool-command">命令: <code>${escapeHtml(tool.command)}</code></div>
+      <div class="cli-tool-actions">${switchBtn}</div>
+    </div>`;
+  }
+  html += '</div></div>';
+
+  // Settings Profiles Section
+  html += '<div class="settings-section">';
+  html += '<div class="settings-header"><h4>Claude Settings 配置管理</h4>';
   html += '<button class="primary-btn settings-new-btn" id="settingsNewBtn">＋ 新建配置</button></div>';
 
   if (editing === 'new') {
@@ -4261,8 +4298,14 @@ function renderSettingsView() {
       </div>`;
     }
   }
+  html += '</div>';
 
   container.innerHTML = html;
+
+  // CLI Tool switch handlers
+  $$('.cli-tool-switch-btn').forEach((btn) => {
+    btn.addEventListener('click', () => switchCliTool(btn.dataset.toolId));
+  });
 
   const newBtn = $('#settingsNewBtn');
   if (newBtn) {
@@ -4309,6 +4352,39 @@ function renderSettingsView() {
         alert('读取失败：' + e.message);
       }
     });
+  }
+}
+
+// ===== CLI Tools =====
+async function loadCliTools() {
+  try {
+    const resp = await api('/api/cli-tools');
+    state.cliTools = resp.tools || [];
+    const active = state.cliTools.find((t) => t.isActive);
+    state.activeCliToolId = active ? active.id : null;
+  } catch (e) {
+    state.cliTools = [];
+    console.error('[loadCliTools]', e);
+  }
+  renderSettingsView();
+}
+
+async function switchCliTool(toolId) {
+  try {
+    const resp = await api('/api/cli-tools/switch', {
+      method: 'POST',
+      body: JSON.stringify({ toolId }),
+    });
+    if (resp.tool) {
+      state.activeCliToolId = resp.tool.id;
+      // Update local state
+      for (const t of state.cliTools) {
+        t.isActive = t.id === toolId;
+      }
+      renderSettingsView();
+    }
+  } catch (e) {
+    alert('切换失败：' + e.message);
   }
 }
 
