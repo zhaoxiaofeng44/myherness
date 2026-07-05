@@ -4,9 +4,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-const VERSION = 1;
-const DEBOUNCE_MS = 200;
-const MAX_BASELINE_SIZE = 200_000;
+const VERSION = 2; // bumped: changes format changed (no diff lines persisted)
+const DEBOUNCE_MS = 300;
+// 持久化时只保留最近的 300 条事件，避免大型会话写盘卡死
+const MAX_PERSISTED_EVENTS = 300;
+// 持久化时只保留最近 50 条工具记录
+const MAX_PERSISTED_TOOLS = 50;
 
 export class SessionStore {
   constructor({ dir }) {
@@ -58,7 +61,7 @@ export class SessionStore {
       clearTimeout(t);
       this._timers.delete(session.id);
     }
-    this._writeSession(session);
+    this._writeSessionSync(session);
   }
 
   flushAll(manager) {
@@ -66,7 +69,7 @@ export class SessionStore {
     this._timers.clear();
     for (const session of manager.sessions.values()) {
       try {
-        this._writeSession(session);
+        this._writeSessionSync(session);
       } catch (e) {
         console.error(`[sessionStore] flush failed ${session.id}:`, e.message);
       }
@@ -89,15 +92,38 @@ export class SessionStore {
     }
   }
 
+  // 异步写盘：JSON.stringify 在主线程（无法避免），但 IO 操作异步化
   _writeSession(session) {
     const payload = serialize(session);
+    const jsonStr = JSON.stringify(payload);
+    const file = path.join(this.dir, `${session.id}.json`);
+    const tmp = file + '.tmp';
+    fs.writeFile(tmp, jsonStr, (err) => {
+      if (err) {
+        console.error(`[sessionStore] write failed ${session.id}:`, err.message);
+        try { fs.unlinkSync(tmp); } catch {}
+        return;
+      }
+      fs.rename(tmp, file, (renameErr) => {
+        if (renameErr) {
+          console.error(`[sessionStore] rename failed ${session.id}:`, renameErr.message);
+          try { fs.unlinkSync(tmp); } catch {}
+        }
+      });
+    });
+  }
+
+  // 同步写盘：用于 shutdown flush，确保数据完整写入
+  _writeSessionSync(session) {
+    const payload = serialize(session);
+    const jsonStr = JSON.stringify(payload);
     const file = path.join(this.dir, `${session.id}.json`);
     const tmp = file + '.tmp';
     try {
-      fs.writeFileSync(tmp, JSON.stringify(payload));
+      fs.writeFileSync(tmp, jsonStr);
       fs.renameSync(tmp, file);
     } catch (e) {
-      console.error(`[sessionStore] write failed ${session.id}:`, e.message);
+      console.error(`[sessionStore] flush write failed ${session.id}:`, e.message);
       try { fs.unlinkSync(tmp); } catch {}
     }
   }
@@ -105,7 +131,7 @@ export class SessionStore {
   _validate(payload) {
     return (
       payload &&
-      payload.version === VERSION &&
+      (payload.version === VERSION || payload.version === 1) &&
       typeof payload.id === 'string' &&
       typeof payload.workdir === 'string'
     );
@@ -119,12 +145,31 @@ export class SessionStore {
 }
 
 function serialize(session) {
-  const fileBaselines = {};
-  for (const [k, v] of Object.entries(session.fileBaselines || {})) {
-    if (typeof v !== 'string') continue;
-    if (v.length > MAX_BASELINE_SIZE) continue;
-    fileBaselines[k] = v;
-  }
+  // 不持久化 fileBaselines（纯内存缓存，启动后从文件重建）
+  // 不持久化 changes 中的 diff lines（只保留摘要）
+
+  const allEvents = Array.isArray(session.events) ? session.events : [];
+  const events = allEvents.length > MAX_PERSISTED_EVENTS
+    ? allEvents.slice(allEvents.length - MAX_PERSISTED_EVENTS)
+    : allEvents;
+
+  const allTools = Array.isArray(session.tools) ? session.tools : [];
+  const tools = allTools.length > MAX_PERSISTED_TOOLS
+    ? allTools.slice(allTools.length - MAX_PERSISTED_TOOLS)
+    : allTools;
+
+  const changes = (Array.isArray(session.changes) ? session.changes : []).map((cs) => ({
+    turnId: cs.turnId,
+    timestamp: cs.timestamp,
+    // 只保留文件摘要，不存 diff lines（前端可按需从 API 拉取）
+    files: (Array.isArray(cs.files) ? cs.files : []).map((f) => ({
+      relPath: f.relPath,
+      kind: f.kind,
+      size: f.size,
+      diffTruncated: f.diffTruncated || undefined,
+    })),
+  }));
+
   return {
     version: VERSION,
     id: session.id,
@@ -137,11 +182,11 @@ function serialize(session) {
     status: session.status,
     claudeSessionId: session.claudeSessionId,
     turns: session.turns,
-    tools: session.tools,
-    changes: session.changes,
+    tools,
+    changes,
     lastChangeMap: session.lastChangeMap,
-    fileBaselines,
+    fileBaselines: {}, // 不持久化，启动后重建
     pendingApprovals: [],
-    events: session.events,
+    events,
   };
 }

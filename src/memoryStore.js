@@ -59,12 +59,36 @@ export class MemoryStore {
 
   _writeNow() {
     const payload = { version: VERSION, entries: this.entries };
+    const jsonStr = JSON.stringify(payload, null, 2);
+    const tmp = this.file + '.tmp';
+    fs.writeFile(tmp, jsonStr, (err) => {
+      if (err) {
+        console.error('[memoryStore] write failed:', err.message);
+        try { fs.unlinkSync(tmp); } catch {}
+        return;
+      }
+      fs.rename(tmp, this.file, (renameErr) => {
+        if (renameErr) {
+          console.error('[memoryStore] rename failed:', renameErr.message);
+          try { fs.unlinkSync(tmp); } catch {}
+        }
+      });
+    });
+  }
+
+  flush() {
+    if (this._timer) {
+      clearTimeout(this._timer);
+      this._timer = null;
+    }
+    // shutdown 时同步写盘确保数据完整
+    const payload = { version: VERSION, entries: this.entries };
     const tmp = this.file + '.tmp';
     try {
       fs.writeFileSync(tmp, JSON.stringify(payload, null, 2));
       fs.renameSync(tmp, this.file);
     } catch (e) {
-      console.error('[memoryStore] write failed:', e.message);
+      console.error('[memoryStore] flush failed:', e.message);
       try { fs.unlinkSync(tmp); } catch {}
     }
   }

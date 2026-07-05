@@ -19,7 +19,6 @@ import { mergeHabit, mergeExperience, hashWorkdir } from './src/memoryEngine.js'
 import { relevantForPrompt } from './src/memoryRetriever.js';
 import { TerminalManager } from './src/terminalManager.js';
 import { GOAL_PROMPT_PATHS } from './src/goalRunner.js';
-import { PeerManager } from './src/peerManager.js';
 import { SettingsProfileStore } from './src/settingsProfiles.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -48,30 +47,6 @@ const sseClients = new Set();
 
 const terminals = new TerminalManager({ broadcast });
 
-// ===== Peer discovery =====
-const peerManager = new PeerManager({ httpPort: PORT });
-peerManager.start();
-
-peerManager.on('peer:added', (peer) => {
-  broadcast('peer:added', peer);
-  peerManager.openBridge(peer.id, handleRemoteEvent);
-});
-peerManager.on('peer:removed', (peer) => {
-  broadcast('peer:removed', peer);
-});
-
-function handleRemoteEvent(peerId, eventType, data) {
-  const mapped = {
-    'session:created': 'remote:session:created',
-    'session:updated': 'remote:session:updated',
-    'session:removed': 'remote:session:removed',
-    'event': 'remote:event',
-  };
-  const outType = mapped[eventType];
-  if (!outType) return;
-  broadcast(outType, { peerId, ...data });
-}
-
 manager.on('session:event', (payload) => broadcast('event', payload));
 manager.on('session:updated', (payload) => broadcast('session:updated', payload));
 manager.on('session:created', (payload) => broadcast('session:created', payload));
@@ -81,9 +56,31 @@ manager.on('session:removed', (payload) => {
 });
 
 function broadcast(kind, data) {
+  if (sseClients.size === 0) return; // 无客户端时跳过序列化
+
   let line;
   try {
-    line = `event: ${kind}\ndata: ${JSON.stringify(data)}\n\n`;
+    const raw = JSON.stringify(data);
+    // 超过 64KB 的 event payload 只推骨架，防止阻塞所有 SSE 客户端
+    if (raw.length > 64 * 1024) {
+      const skeleton = {
+        sessionId: data && typeof data === 'object' ? data.sessionId : undefined,
+        event:
+          data && typeof data === 'object' && data.event && typeof data.event === 'object'
+            ? {
+                id: data.event.id,
+                ts: data.event.ts,
+                type: data.event.type,
+                turnId: data.event.turnId,
+                _truncated: true,
+                _reason: `payload too large (${raw.length} bytes)`,
+              }
+            : { _truncated: true, _reason: `payload too large (${raw.length} bytes)` },
+      };
+      line = `event: ${kind}\ndata: ${JSON.stringify(skeleton)}\n\n`;
+    } else {
+      line = `event: ${kind}\ndata: ${raw}\n\n`;
+    }
   } catch (e) {
     // V8 caps strings at ~512MB; an oversized event would otherwise crash the
     // server. Fall back to a stub so the UI sees something happened.
@@ -168,31 +165,6 @@ const server = http.createServer(async (req, res) => {
         globalContent: readSafe(GOAL_PROMPT_PATHS.global),
         projectContent: readSafe(projectPath),
       });
-    }
-
-    // ===== Peer routes =====
-    if (pathname === '/api/peers' && req.method === 'GET') {
-      return json(res, 200, {
-        peers: peerManager.getPeers(),
-        instanceId: peerManager.instanceId,
-        lanMode: peerManager.isActive(),
-      });
-    }
-
-    // ===== Remote proxy routes =====
-    const remoteMatch = pathname.match(/^\/api\/remote\/([^/]+)(\/.*)?$/);
-    if (remoteMatch) {
-      const peerId = remoteMatch[1];
-      const remotePath = '/api' + (remoteMatch[2] || '');
-      try {
-        const body = req.method !== 'GET' ? await readJson(req).catch(() => ({})) : null;
-        const result = await peerManager.proxyRequest(peerId, req.method, remotePath, body);
-        res.writeHead(result.status, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(result.body);
-      } catch (e) {
-        return json(res, 502, { error: e.message });
-      }
-      return;
     }
 
     if (pathname === '/api/sessions' && req.method === 'GET')
@@ -368,12 +340,27 @@ const server = http.createServer(async (req, res) => {
 
       if (rest === '' || rest === '/') {
         if (req.method === 'GET') {
+          // 对大数组截断：events 和 tools 只返回最近的部分，
+          // 前端可按需分页拉取完整数据
+          const maxEventsInResponse = 300;
+          const maxToolsInResponse = 50;
+          const allEvents = Array.isArray(session.events) ? session.events : [];
+          const allTools = Array.isArray(session.tools) ? session.tools : [];
+          const eventsSlice = allEvents.length > maxEventsInResponse
+            ? allEvents.slice(allEvents.length - maxEventsInResponse)
+            : allEvents;
+          const toolsSlice = allTools.length > maxToolsInResponse
+            ? allTools.slice(allTools.length - maxToolsInResponse)
+            : allTools;
           return json(res, 200, {
             session: session.summary(),
             policy: getPolicy(session.policyId),
             turns: session.turns,
-            events: session.events,
-            tools: session.tools,
+            events: eventsSlice,
+            eventsTotal: allEvents.length,
+            eventsOffset: allEvents.length > maxEventsInResponse ? allEvents.length - maxEventsInResponse : 0,
+            tools: toolsSlice,
+            toolsTotal: allTools.length,
             changes: session.changes,
             pendingApprovals: Array.from(session.pendingApprovals.values()),
           });
@@ -615,18 +602,12 @@ server.listen(PORT, () => {
   console.log(`Working directory: ${process.cwd()}`);
   console.log(`Session data dir: ${DATA_DIR}`);
   console.log(`Memory file: ${MEMORY_FILE}`);
-  if (peerManager.isActive()) {
-    console.log(`LAN discovery active, instance: ${peerManager.instanceId}`);
-  } else {
-    console.log('LAN discovery disabled (no 192.168.x.x interface)');
-  }
 });
 
 let shuttingDown = false;
 function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
-  try { peerManager.stop(); } catch {}
   try { deciderQueue.abortAll(); } catch {}
   for (const s of manager.sessions.values()) {
     try { s.cancel(); } catch {}

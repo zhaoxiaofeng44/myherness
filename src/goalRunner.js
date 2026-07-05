@@ -52,6 +52,7 @@ export function cleanGoalArtefacts(workdir) {
 const DEFAULT_MAX_ITERATIONS = 12;
 const INITIAL_RETRY_DELAY = 15_000;  // 15s
 const MAX_RETRY_DELAY = 600_000;     // 10 min
+const MAX_RETRY_ATTEMPTS = 6;        // 最多重试 6 次，防止无限循环
 
 const PHASE_LABELS = {
   planning: '规划中',
@@ -454,9 +455,11 @@ export class GoalRunner {
   }
 
   async _attemptRetry(reason) {
-    while (this.status === 'active') {
+    let attempts = 0;
+    while (this.status === 'active' && attempts < MAX_RETRY_ATTEMPTS) {
+      attempts++;
       const delay = this._retryDelay;
-      this._record('goal:retry-waiting', { reason, delayMs: delay });
+      this._record('goal:retry-waiting', { reason, delayMs: delay, attempt: attempts, maxAttempts: MAX_RETRY_ATTEMPTS });
       this._broadcast();
 
       await this._sleep(delay);
@@ -465,21 +468,29 @@ export class GoalRunner {
       const networkOk = await checkNetwork();
       if (!networkOk) {
         this._retryDelay = Math.min(this._retryDelay * 2, MAX_RETRY_DELAY);
-        this._record('goal:network-unavailable', { nextDelayMs: this._retryDelay });
+        this._record('goal:network-unavailable', { nextDelayMs: this._retryDelay, attempt: attempts });
         this._broadcast();
         continue;
       }
 
-      this._record('goal:retrying', {});
+      this._record('goal:retrying', { attempt: attempts });
       this._broadcast();
       try {
         await this.session.sendPrompt('继续', { fromGoal: true });
         this._retryDelay = Math.min(this._retryDelay * 2, MAX_RETRY_DELAY);
         return;
       } catch (e) {
-        this._record('goal:retry-send-failed', { error: e.message });
+        this._record('goal:retry-send-failed', { error: e.message, attempt: attempts });
         this._retryDelay = Math.min(this._retryDelay * 2, MAX_RETRY_DELAY);
       }
+    }
+    // 超过最大重试次数，停止 Goal 闭环
+    if (this.status === 'active') {
+      this.status = 'failed';
+      this.lastReason = `重试超过 ${MAX_RETRY_ATTEMPTS} 次，自动停止`;
+      this._record('goal:failed', { reason: this.lastReason });
+      this._detachListener();
+      this._broadcast();
     }
   }
 

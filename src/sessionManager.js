@@ -24,6 +24,24 @@ const nextId = () => `s${Date.now().toString(36)}${(_id++).toString(36)}`;
 
 const MAX_EVENTS = 5000;
 
+// 高频事件类型 - 这些事件不每次触发写盘，而是统一节流
+const HIGH_FREQ_EVENT_TYPES = new Set([
+  'assistant:text',
+  'assistant:thinking',
+  'tool:result',
+  'cli:rawline',
+  'cli:event',
+]);
+
+// SSE 单条 event 数据超过此字节数时，只广播 summary 骨架，避免阻塞
+const SSE_MAX_INLINE_BYTES = 64 * 1024; // 64KB
+
+// stdout 单批最多处理行数，超出放到下一个 setImmediate
+const STDOUT_BATCH_SIZE = 20;
+
+// 内存中 changes 只保留最近 N 个 turn 的完整 diff，更早的只保留摘要
+const MAX_FULL_DIFF_CHANGESETS = 3;
+
 export class SessionManager extends EventEmitter {
   constructor({ store, memoryStore, deciderQueue } = {}) {
     super();
@@ -323,13 +341,30 @@ class Session {
     // We capture lazily on-demand from snapshot keys.
 
     let stdoutBuf = '';
-    child.stdout.on('data', (chunk) => {
-      stdoutBuf += chunk.toString('utf8');
+    let stdoutProcessing = false;
+
+    const processStdoutLines = () => {
+      stdoutProcessing = true;
+      let processed = 0;
       let idx;
       while ((idx = stdoutBuf.indexOf('\n')) >= 0) {
         const line = stdoutBuf.slice(0, idx).trim();
         stdoutBuf = stdoutBuf.slice(idx + 1);
         if (line) this._handleStreamLine(line);
+        processed++;
+        // 每批处理 STDOUT_BATCH_SIZE 行后让出主线程，避免长输出卡死事件循环
+        if (processed >= STDOUT_BATCH_SIZE && stdoutBuf.includes('\n')) {
+          setImmediate(processStdoutLines);
+          return;
+        }
+      }
+      stdoutProcessing = false;
+    };
+
+    child.stdout.on('data', (chunk) => {
+      stdoutBuf += chunk.toString('utf8');
+      if (!stdoutProcessing) {
+        processStdoutLines();
       }
     });
 
@@ -357,6 +392,32 @@ class Session {
         this._killEscalateTimer = null;
       }
       if (stdoutBuf.trim()) this._handleStreamLine(stdoutBuf.trim());
+
+      // 检测 --resume 会话 ID 失效：自动清除并以全新会话重试（最多一次）
+      const staleSessionErr = !this._cancelRequested &&
+        !opts._staleRetry && // 防止无限重试：只允许一次
+        code !== 0 &&
+        stderrBuf.includes('No conversation found with session ID');
+      if (staleSessionErr) {
+        const staleId = this.claudeSessionId;
+        this.claudeSessionId = null;
+        this._record({
+          type: 'cli:session-stale',
+          staleSessionId: staleId,
+          message: '会话 ID 已失效，自动清除并以新会话重试',
+        });
+        this.activeChild = null;
+        this.turns.pop();
+        this.activeTurn = null;
+        this.status = 'idle';
+        setImmediate(() => {
+          this.sendPrompt(prompt, { ...opts, _staleRetry: true }).catch((e) => {
+            this._record({ type: 'turn:error', error: '重试失败: ' + e.message });
+          });
+        });
+        return;
+      }
+
       // If the user clicked stop, mark the turn cancelled rather than errored —
       // a non-zero exit from a SIGTERM/SIGKILL is expected, not a real failure.
       let outcome;
@@ -883,8 +944,37 @@ class Session {
     }
     this.activeChild = null;
 
-    // Compute file changes for the turn.
-    // Wrapped in try-catch: diff failures must never block status broadcast.
+    if (turn && this._deciderQueue) {
+      try { this._deciderQueue.resetTurn(this.id, turn.id); } catch {}
+    }
+
+    this.activeTurn = null;
+    this._killedForPendingInput = false;
+    if (this.pendingApprovals.size > 0) {
+      this.status = 'waiting';
+    } else {
+      this.status = reason === 'error' ? 'error' : 'idle';
+    }
+    this._broadcastSummary();
+
+    // diff 计算放到 setImmediate，不阻塞当前事件循环
+    setImmediate(() => this._computeTurnChanges(turn, reason));
+
+    // 排空 AUQ 接续
+    if (this._pendingFollowUp && reason !== 'error') {
+      const p = this._pendingFollowUp;
+      this._pendingFollowUp = null;
+      setImmediate(() => {
+        this.sendPrompt(p, { fromAUQ: true }).catch((e) => {
+          this._record({ type: 'turn:error', error: 'AUQ 接续失败: ' + e.message });
+        });
+      });
+    } else if (this._pendingFollowUp) {
+      this._pendingFollowUp = null;
+    }
+  }
+
+  _computeTurnChanges(turn, reason) {
     try {
       const changedFiles = this.changeTracker.diff();
       if (changedFiles.length > 0 && turn) {
@@ -946,32 +1036,28 @@ class Session {
 
     if (turn) this._record({ type: 'turn:end', turnId: turn.id, status: turn.status });
 
-    if (turn && this._deciderQueue) {
-      try { this._deciderQueue.resetTurn(this.id, turn.id); } catch {}
+    // 裁剪旧 changeSet 的 diff lines：只保留最近 MAX_FULL_DIFF_CHANGESETS 个
+    // 超出的只保留摘要（relPath + kind + size），释放内存
+    if (this.changes.length > MAX_FULL_DIFF_CHANGESETS) {
+      const trimFrom = this.changes.length - MAX_FULL_DIFF_CHANGESETS;
+      for (let i = 0; i < trimFrom; i++) {
+        const cs = this.changes[i];
+        if (!cs || !Array.isArray(cs.files)) continue;
+        let trimmed = false;
+        for (const f of cs.files) {
+          if (Array.isArray(f.diff) && f.diff.length > 0) {
+            f.diff = null;
+            f.diffPurged = true;
+            trimmed = true;
+          }
+        }
+        if (trimmed) {
+          this._record({ type: 'turn:changes-purged', turnId: cs.turnId });
+        }
+      }
     }
 
-    this.activeTurn = null;
-    this._killedForPendingInput = false;
-    if (this.pendingApprovals.size > 0) {
-      this.status = 'waiting';
-    } else {
-      this.status = reason === 'error' ? 'error' : 'idle';
-    }
-    this._broadcastSummary();
-
-    // 排空 AUQ 接续：上一轮里用户回答的内容，作为新一轮 prompt 自动发出。
-    // 仅在非 error 终态触发，避免上一轮失败后还硬接续。
-    if (this._pendingFollowUp && reason !== 'error') {
-      const p = this._pendingFollowUp;
-      this._pendingFollowUp = null;
-      setImmediate(() => {
-        this.sendPrompt(p, { fromAUQ: true }).catch((e) => {
-          this._record({ type: 'turn:error', error: 'AUQ 接续失败: ' + e.message });
-        });
-      });
-    } else if (this._pendingFollowUp) {
-      this._pendingFollowUp = null;
-    }
+    this._store?.scheduleSave(this);
   }
 
   _record(event) {
@@ -981,7 +1067,24 @@ class Session {
       this.events.splice(0, this.events.length - MAX_EVENTS);
     }
     this.bus.emit('session:event', { sessionId: this.id, event: enriched });
-    this._store?.scheduleSave(this);
+    // 高频事件节流：不每次都触发写盘，由 _flushRecordSave 统一批量写
+    if (HIGH_FREQ_EVENT_TYPES.has(event.type)) {
+      this._scheduleFlushSave();
+    } else {
+      this._store?.scheduleSave(this);
+    }
+  }
+
+  // 高频事件聚合写盘：100ms 内批量合并触发一次
+  _scheduleFlushSave() {
+    if (this._flushSaveTimer) return;
+    this._flushSaveTimer = setTimeout(() => {
+      this._flushSaveTimer = null;
+      this._store?.scheduleSave(this);
+    }, 100);
+    if (typeof this._flushSaveTimer?.unref === 'function') {
+      this._flushSaveTimer.unref();
+    }
   }
 
   _broadcastSummary() {
