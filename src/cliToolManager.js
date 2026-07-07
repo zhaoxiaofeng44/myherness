@@ -33,6 +33,15 @@ const SUPPORTED_TOOLS = [
     },
     supportsResume: true,
     supportsStreamJson: true,
+    // Event type mapping for output parsing
+    eventTypes: {
+      init: { type: 'system', subtype: 'init', sessionIdField: 'session_id' },
+      assistantText: { type: 'assistant', contentPath: 'message.content' },
+      toolUse: { type: 'assistant', blockType: 'tool_use' },
+      thinking: { type: 'assistant', blockType: 'thinking' },
+      toolResult: { type: 'user', blockType: 'tool_result' },
+      result: { type: 'result' },
+    },
   },
   {
     id: 'codex',
@@ -41,36 +50,46 @@ const SUPPORTED_TOOLS = [
     description: 'OpenAI Codex CLI',
     // Build args for codex CLI - uses 'codex exec' for non-interactive mode
     buildArgs: ({ prompt, permissionMode, resumeSessionId, useStdin }) => {
-      // Use 'exec' subcommand for non-interactive mode
       const args = ['exec'];
       
       // Output format: --json for JSONL event stream
       args.push('--json');
       
-      // Approval mode mapping: plan -> untrusted (safest), other -> on-request
-      const approvalMode = permissionMode === 'plan' ? 'untrusted' : 'on-request';
-      args.push('--ask-for-approval', approvalMode);
-      
-      // Sandbox policy: plan -> read-only, other -> workspace-write
+      // Sandbox policy: plan -> read-only (safest), other -> workspace-write
       const sandbox = permissionMode === 'plan' ? 'read-only' : 'workspace-write';
       args.push('--sandbox', sandbox);
       
-      // Resume session if supported
+      // Resume session: codex exec resume <SESSION_ID> [PROMPT]
       if (resumeSessionId) {
         args.push('resume', resumeSessionId);
-      }
-      
-      // Prompt: either as argument or from stdin
-      if (!useStdin && prompt) {
-        args.push(prompt);
-      } else if (useStdin) {
-        args.push('-'); // Read from stdin
+        // When resuming, prompt is optional and comes after session ID
+        if (!useStdin && prompt) {
+          args.push(prompt);
+        } else if (useStdin) {
+          args.push('-'); // Read additional prompt from stdin
+        }
+      } else {
+        // Normal execution: prompt as argument or from stdin
+        if (!useStdin && prompt) {
+          args.push(prompt);
+        } else if (useStdin) {
+          args.push('-'); // Read from stdin
+        }
       }
       
       return args;
     },
     supportsResume: true,
     supportsStreamJson: true,
+    // Codex uses similar event structure to Claude for compatibility
+    eventTypes: {
+      init: { type: 'system', subtype: 'init', sessionIdField: 'session_id' },
+      assistantText: { type: 'assistant', contentPath: 'message.content' },
+      toolUse: { type: 'assistant', blockType: 'tool_use' },
+      thinking: { type: 'assistant', blockType: 'thinking' },
+      toolResult: { type: 'user', blockType: 'tool_result' },
+      result: { type: 'result' },
+    },
   },
   {
     id: 'qoder',
@@ -97,14 +116,22 @@ const SUPPORTED_TOOLS = [
         args.push('-r', resumeSessionId);
       }
       
-      // Permission mode: plan -> no special flag (default safe mode)
-      // For full access, would use --dangerously-skip-permissions or --yolo
-      // We don't add dangerous flags by default for safety
+      // Note: Qoder may not support stdin input for prompt in non-interactive mode
+      // If useStdin is true and no prompt, we skip -p entirely
       
       return args;
     },
     supportsResume: true,
     supportsStreamJson: true,
+    // Qoder uses similar event structure for compatibility
+    eventTypes: {
+      init: { type: 'system', subtype: 'init', sessionIdField: 'session_id' },
+      assistantText: { type: 'assistant', contentPath: 'message.content' },
+      toolUse: { type: 'assistant', blockType: 'tool_use' },
+      thinking: { type: 'assistant', blockType: 'thinking' },
+      toolResult: { type: 'user', blockType: 'tool_result' },
+      result: { type: 'result' },
+    },
   },
 ];
 
@@ -238,5 +265,13 @@ export class CliToolManager {
   buildArgs(options) {
     const builder = this.getArgsBuilder();
     return builder(options);
+  }
+
+  /**
+   * Get event type mapping for the active tool (for output parsing)
+   */
+  getEventTypes() {
+    const tool = SUPPORTED_TOOLS.find((t) => t.id === this.activeToolId);
+    return tool ? tool.eventTypes : SUPPORTED_TOOLS[0].eventTypes;
   }
 }
